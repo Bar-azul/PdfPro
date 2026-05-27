@@ -1,0 +1,12 @@
+[build]
+builder = "dockerfile"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+startCommand = "python run.py"
+restartPolicyType = "on-failure"
+restartPolicyMaxRetries = 3
+
+[environments.production]
+[environments.production.variables]
+PORT = "8000"
