@@ -33,8 +33,8 @@ arabic-reshaper==3.0.0
 # ── Auth ───────────────────────────────────────────────────────────────────────
 python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
-pydantic[email]==2.8.2
-pydantic-settings==2.4.0
+pydantic[email]>=2.10.0
+pydantic-settings>=2.6.0
 email-validator==2.2.0
 
 # ── Rate limiting ──────────────────────────────────────────────────────────────
