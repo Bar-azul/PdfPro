@@ -1,0 +1,34 @@
+# render.yaml — Render Blueprint
+# שים קובץ זה בתיקיית backend/
+
+services:
+  - type: web
+    name: pdfpro-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free          # שנה ל-starter ($7/mo) להסרת ה-spin-down
+    region: frankfurt   # הכי קרוב לישראל
+    envVars:
+      - key: PORT
+        value: 8000
+      - key: DEBUG
+        value: false
+      - key: SECRET_KEY
+        generateValue: true       # Render יוצר אוטומטית
+      - key: DATABASE_URL
+        fromDatabase:
+          name: pdfpro-db
+          property: connectionString
+      - key: BASE_URL
+        sync: false               # תמלא ידנית אחרי deploy
+      - key: FRONTEND_URL
+        sync: false
+      - key: TRANZILA_SUPPLIER
+        sync: false               # תמלא ידנית
+
+databases:
+  - name: pdfpro-db
+    plan: free                    # 1GB, תקף 90 יום. שנה ל-starter ($7/mo) לצמיתות
+    region: frankfurt
+    databaseName: pdfpro
+    user: pdfpro_user
