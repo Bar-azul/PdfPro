@@ -14,6 +14,7 @@ limiter = Limiter(
     key_func=get_remote_address,
     default_limits=[settings.RATE_LIMIT_FREE],
     storage_uri="memory://",
+    config_filename=None,
 )
 
 
