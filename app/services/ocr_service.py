@@ -1,7 +1,5 @@
 """
-OCRService — memory optimized for Render 512MB.
-- Images: processed directly with Tesseract (no PDF conversion overhead)
-- PDFs: page-by-page with immediate memory cleanup
+OCRService — memory optimized + auto-rotation + image enhancement.
 """
 
 import gc
@@ -11,7 +9,7 @@ from pathlib import Path
 
 import fitz
 import pytesseract
-from PIL import Image
+from PIL import Image, ImageEnhance
 
 from ..config import settings
 from ..services.pdf_service import _temp_pdf, _temp_file, _ms
@@ -27,7 +25,6 @@ def _is_image(path: Path) -> bool:
 
 
 def _image_to_pdf(image_path: Path) -> Path:
-    """Convert image to single-page PDF (only for searchable PDF output)."""
     with Image.open(image_path) as img:
         if img.mode in ("RGBA", "P"):
             img = img.convert("RGB")
@@ -36,6 +33,49 @@ def _image_to_pdf(image_path: Path) -> Path:
         out = _temp_pdf("img_as_pdf")
         img.save(str(out), format="PDF", resolution=150)
     return out
+
+
+def _prepare_image(img: Image.Image) -> Image.Image:
+    """
+    Prepare image for best OCR accuracy:
+    1. Resize if too large
+    2. Auto-detect and fix rotation
+    3. Convert to grayscale
+    4. Enhance contrast and sharpness
+    """
+    # Step 1 — Resize if too large
+    max_px = 3000
+    if max(img.width, img.height) > max_px:
+        ratio = max_px / max(img.width, img.height)
+        img = img.resize(
+            (int(img.width * ratio), int(img.height * ratio)),
+            Image.LANCZOS,
+        )
+
+    # Step 2 — Convert to RGB for OSD
+    if img.mode not in ("RGB", "L"):
+        img = img.convert("RGB")
+
+    # Step 3 — Auto-detect and fix rotation
+    try:
+        osd = pytesseract.image_to_osd(
+            img,
+            output_type=pytesseract.Output.DICT,
+            config="--psm 0",
+        )
+        angle = osd.get("rotate", 0)
+        if angle and angle != 0:
+            img = img.rotate(-angle, expand=True)
+            logger.info(f"Auto-rotated image by {angle}°")
+    except Exception as e:
+        logger.debug(f"OSD failed (continuing without rotation): {e}")
+
+    # Step 4 — Grayscale + enhance
+    img = img.convert("L")
+    img = ImageEnhance.Contrast(img).enhance(2.0)
+    img = ImageEnhance.Sharpness(img).enhance(2.0)
+
+    return img
 
 
 class OCRService:
@@ -49,7 +89,7 @@ class OCRService:
     ) -> list[dict]:
         t0 = time.time()
 
-        # ── IMAGE: run Tesseract directly — no PDF overhead ───────────────────
+        # ── IMAGE: direct Tesseract — no PDF overhead ─────────────────────────
         if _is_image(pdf_path):
             result = OCRService.ocr_image(pdf_path, language=language)
             logger.info(f"Image OCR (direct) in {_ms(t0)}ms")
@@ -71,7 +111,7 @@ class OCRService:
                     continue
                 page = doc[i]
 
-                # Use native text if available (no OCR needed)
+                # Use native text if available
                 native_text = page.get_text().strip()
                 if native_text and len(native_text) > 50:
                     results.append({
@@ -82,10 +122,12 @@ class OCRService:
                     })
                     continue
 
-                # Render page → image → OCR
+                # Render → prepare → OCR
                 pix = page.get_pixmap(matrix=matrix, alpha=False)
                 img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-                del pix  # free immediately
+                del pix
+
+                img = _prepare_image(img)
 
                 data = pytesseract.image_to_data(
                     img,
@@ -93,7 +135,7 @@ class OCRService:
                     config="--oem 3 --psm 3",
                     output_type=pytesseract.Output.DICT,
                 )
-                del img  # free immediately
+                del img
 
                 words = [
                     w for w, c in zip(data["text"], data["conf"])
@@ -133,21 +175,13 @@ class OCRService:
     def extract_to_searchable_pdf(
         pdf_path: Path, language: str = "heb+eng", dpi: int = 200
     ) -> Path:
-        """
-        Create a searchable PDF with invisible OCR text layer.
-        Images: OCR directly → create PDF → add text layer (no double rendering)
-        PDFs: OCR page by page → add text layer
-        """
         t0 = time.time()
         is_img = _is_image(pdf_path)
 
-        # ── IMAGE INPUT ───────────────────────────────────────────────────────
+        # ── IMAGE: OCR directly → create PDF → add text layer ─────────────────
         if is_img:
-            # Step 1: OCR directly on the image (no PDF conversion yet)
             result = OCRService.ocr_image(pdf_path, language=language)
             ocr_text = result["text"]
-
-            # Step 2: create PDF from image
             actual_path = _image_to_pdf(pdf_path)
             try:
                 with fitz.open(actual_path) as doc:
@@ -167,11 +201,10 @@ class OCRService:
             finally:
                 actual_path.unlink(missing_ok=True)
                 gc.collect()
-
             logger.info(f"Searchable PDF (image) in {_ms(t0)}ms")
             return out
 
-        # ── PDF INPUT ─────────────────────────────────────────────────────────
+        # ── PDF: page by page OCR → add text layer ────────────────────────────
         results = OCRService.extract_text(pdf_path, language=language, dpi=dpi)
         text_by_page = {r["page"]: r["text"] for r in results}
 
@@ -189,7 +222,6 @@ class OCRService:
                     )
                 except Exception as e:
                     logger.warning(f"insert_text failed page {page_num}: {e}")
-
             out = _temp_pdf("searchable")
             doc.save(out, deflate=True)
 
@@ -207,7 +239,6 @@ class OCRService:
 
         results = OCRService.extract_text(pdf_path, language=language, dpi=dpi)
         doc = Document()
-
         title = doc.add_heading("מסמך מחולץ — OCR", level=1)
         title.alignment = WD_ALIGN_PARAGRAPH.RIGHT
 
@@ -229,22 +260,12 @@ class OCRService:
     def ocr_image(image_path: Path, language: str = "heb+eng") -> dict:
         """
         Run Tesseract directly on an image file.
-        Resizes large images to save memory.
+        Auto-detects rotation and enhances image quality before OCR.
         """
         t0 = time.time()
 
         with Image.open(image_path) as img:
-            # Resize if too large (saves significant memory)
-            max_px = 3000
-            if max(img.width, img.height) > max_px:
-                ratio = max_px / max(img.width, img.height)
-                new_size = (int(img.width * ratio), int(img.height * ratio))
-                img = img.resize(new_size, Image.LANCZOS)
-                logger.info(f"Resized image to {new_size} for OCR")
-
-            if img.mode not in ("RGB", "L"):
-                img = img.convert("RGB")
-
+            img = _prepare_image(img)
             data = pytesseract.image_to_data(
                 img,
                 lang=language,
