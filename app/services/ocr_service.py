@@ -1,9 +1,9 @@
 """
-OCRService — with memory optimizations for Render 512MB.
+OCRService — memory optimized for Render 512MB.
+Images are processed directly with Tesseract (no PDF conversion overhead).
 """
 
 import gc
-import io
 import logging
 import time
 from pathlib import Path
@@ -18,8 +18,16 @@ from ..services.pdf_service import _temp_pdf, _temp_file, _ms
 logger = logging.getLogger(__name__)
 pytesseract.pytesseract.tesseract_cmd = settings.TESSERACT_PATH
 
+# ── Supported image extensions ────────────────────────────────────────────────
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp", ".webp", ".gif"}
+
+
+def _is_image(path: Path) -> bool:
+    return path.suffix.lower() in IMAGE_EXTS
+
 
 def _image_to_pdf(image_path: Path) -> Path:
+    """Convert image to single-page PDF (used only for searchable PDF output)."""
     with Image.open(image_path) as img:
         if img.mode in ("RGBA", "P"):
             img = img.convert("RGB")
@@ -30,91 +38,88 @@ def _image_to_pdf(image_path: Path) -> Path:
     return out
 
 
-def _ensure_pdf(path: Path) -> tuple[Path, bool]:
-    try:
-        doc = fitz.open(path)
-        is_pdf = doc.is_pdf
-        doc.close()
-        if is_pdf:
-            return path, False
-    except Exception:
-        pass
-    logger.info(f"Converting image to PDF for OCR: {path.name}")
-    return _image_to_pdf(path), True
-
-
 class OCRService:
 
     @staticmethod
     def extract_text(
         pdf_path: Path,
         language: str = "heb+eng",
-        dpi: int = 200,          # ← הורדנו מ-300 ל-200 לחסוך RAM
+        dpi: int = 200,
         pages: list[int] | None = None,
     ) -> list[dict]:
         t0 = time.time()
+
+        # ── IMAGE INPUT: run Tesseract directly — no PDF overhead ─────────────
+        if _is_image(pdf_path):
+            result = OCRService.ocr_image(pdf_path, language=language)
+            logger.info(f"Image OCR (direct) in {_ms(t0)}ms")
+            return [{
+                "page": 1,
+                "text": result["text"],
+                "confidence": result["confidence"],
+                "source": "ocr",
+            }]
+
+        # ── PDF INPUT ─────────────────────────────────────────────────────────
         results = []
         matrix = fitz.Matrix(dpi / 72, dpi / 72)
-        actual_path, is_temp = _ensure_pdf(pdf_path)
 
-        try:
-            with fitz.open(actual_path) as doc:
-                target = [p - 1 for p in pages] if pages else range(doc.page_count)
-                for i in target:
-                    if not (0 <= i < doc.page_count):
-                        continue
-                    page = doc[i]
+        with fitz.open(pdf_path) as doc:
+            target = [p - 1 for p in pages] if pages else range(doc.page_count)
 
-                    native_text = page.get_text().strip()
-                    if native_text and len(native_text) > 50:
-                        results.append({
-                            "page": i + 1,
-                            "text": native_text,
-                            "confidence": 1.0,
-                            "source": "native",
-                        })
-                        continue
+            for i in target:
+                if not (0 <= i < doc.page_count):
+                    continue
+                page = doc[i]
 
-                    # Render page to image
-                    pix = page.get_pixmap(matrix=matrix, alpha=False)
-                    img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-                    del pix  # ← שחרר זיכרון מיד
-
-                    data = pytesseract.image_to_data(
-                        img,
-                        lang=language,
-                        config="--oem 3 --psm 3",
-                        output_type=pytesseract.Output.DICT,
-                    )
-                    del img  # ← שחרר זיכרון מיד
-
-                    words = [
-                        w for w, c in zip(data["text"], data["conf"])
-                        if w.strip() and int(c) > 20
-                    ]
-                    page_text = " ".join(words)
-                    valid_confs = [int(c) for c in data["conf"] if int(c) > 0]
-                    avg_conf = (sum(valid_confs) / len(valid_confs) / 100) if valid_confs else 0.0
-
+                # Try native text first (no OCR needed)
+                native_text = page.get_text().strip()
+                if native_text and len(native_text) > 50:
                     results.append({
                         "page": i + 1,
-                        "text": page_text,
-                        "confidence": round(avg_conf, 3),
-                        "source": "ocr",
+                        "text": native_text,
+                        "confidence": 1.0,
+                        "source": "native",
                     })
+                    continue
 
-                    gc.collect()  # ← נקה זיכרון בין עמודים
+                # Render page → OCR
+                pix = page.get_pixmap(matrix=matrix, alpha=False)
+                img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+                del pix  # free immediately
 
-        finally:
-            if is_temp and actual_path.exists():
-                actual_path.unlink(missing_ok=True)
-            gc.collect()
+                data = pytesseract.image_to_data(
+                    img,
+                    lang=language,
+                    config="--oem 3 --psm 3",
+                    output_type=pytesseract.Output.DICT,
+                )
+                del img  # free immediately
 
+                words = [
+                    w for w, c in zip(data["text"], data["conf"])
+                    if w.strip() and int(c) > 20
+                ]
+                page_text = " ".join(words)
+                valid_confs = [int(c) for c in data["conf"] if int(c) > 0]
+                avg_conf = (sum(valid_confs) / len(valid_confs) / 100) if valid_confs else 0.0
+
+                results.append({
+                    "page": i + 1,
+                    "text": page_text,
+                    "confidence": round(avg_conf, 3),
+                    "source": "ocr",
+                })
+                gc.collect()
+
+        gc.collect()
         logger.info(f"OCR: {len(results)} pages, lang={language} in {_ms(t0)}ms")
         return results
 
     @staticmethod
-    def extract_to_txt(pdf_path: Path, language: str = "heb+eng", dpi: int = 200) -> Path:
+    def extract_to_txt(
+        pdf_path: Path, language: str = "heb+eng", dpi: int = 200
+    ) -> Path:
         results = OCRService.extract_text(pdf_path, language=language, dpi=dpi)
         out = _temp_file("ocr_output", ".txt")
         lines = []
@@ -130,8 +135,12 @@ class OCRService:
     def extract_to_searchable_pdf(
         pdf_path: Path, language: str = "heb+eng", dpi: int = 200
     ) -> Path:
+        """Create searchable PDF. For images, converts to PDF first."""
         t0 = time.time()
-        actual_path, is_temp = _ensure_pdf(pdf_path)
+
+        # For image input: convert to PDF first, then add OCR layer
+        is_img = _is_image(pdf_path)
+        actual_path = _image_to_pdf(pdf_path) if is_img else pdf_path
 
         try:
             results = OCRService.extract_text(actual_path, language=language, dpi=dpi)
@@ -141,9 +150,8 @@ class OCRService:
                 for page_num, text in text_by_page.items():
                     if not text.strip():
                         continue
-                    page = doc[page_num - 1]
                     try:
-                        page.insert_text(
+                        doc[page_num - 1].insert_text(
                             fitz.Point(10, 20),
                             text,
                             fontsize=1,
@@ -151,20 +159,22 @@ class OCRService:
                             overlay=False,
                         )
                     except Exception as e:
-                        logger.warning(f"Could not insert text on page {page_num}: {e}")
+                        logger.warning(f"insert_text failed page {page_num}: {e}")
 
                 out = _temp_pdf("searchable")
                 doc.save(out, deflate=True)
         finally:
-            if is_temp and actual_path.exists():
+            if is_img and actual_path.exists():
                 actual_path.unlink(missing_ok=True)
             gc.collect()
 
-        logger.info(f"Searchable PDF created in {_ms(t0)}ms")
+        logger.info(f"Searchable PDF in {_ms(t0)}ms")
         return out
 
     @staticmethod
-    def extract_to_docx(pdf_path: Path, language: str = "heb+eng", dpi: int = 200) -> Path:
+    def extract_to_docx(
+        pdf_path: Path, language: str = "heb+eng", dpi: int = 200
+    ) -> Path:
         from docx import Document
         from docx.shared import Pt
         from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -191,10 +201,21 @@ class OCRService:
 
     @staticmethod
     def ocr_image(image_path: Path, language: str = "heb+eng") -> dict:
+        """Run Tesseract directly on an image file — no PDF conversion."""
         t0 = time.time()
+
         with Image.open(image_path) as img:
+            # Resize if too large (saves memory)
+            max_px = 3000
+            if max(img.width, img.height) > max_px:
+                ratio = max_px / max(img.width, img.height)
+                new_size = (int(img.width * ratio), int(img.height * ratio))
+                img = img.resize(new_size, Image.LANCZOS)
+                logger.info(f"Resized image to {new_size} for OCR")
+
             if img.mode not in ("RGB", "L"):
                 img = img.convert("RGB")
+
             data = pytesseract.image_to_data(
                 img,
                 lang=language,
