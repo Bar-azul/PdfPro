@@ -50,7 +50,7 @@ class Settings(BaseSettings):
     TRANZILA_TERMINAL_PASSWORD: str = ""
 
     # ── External ──────────────────────────────────────────────────────────────
-    LIBREOFFICE_PATH: str = "C:\Program Files\LibreOffice\program\soffice.exe"
+    LIBREOFFICE_PATH: str = "libreoffice"
     TESSERACT_PATH: str = "/usr/bin/tesseract"
     OCR_LANGUAGES: list[str] = ["heb", "eng", "ara"]
 
