@@ -1,6 +1,7 @@
 """
 OCRService — memory optimized for Render 512MB.
-Images are processed directly with Tesseract (no PDF conversion overhead).
+- Images: processed directly with Tesseract (no PDF conversion overhead)
+- PDFs: page-by-page with immediate memory cleanup
 """
 
 import gc
@@ -18,7 +19,6 @@ from ..services.pdf_service import _temp_pdf, _temp_file, _ms
 logger = logging.getLogger(__name__)
 pytesseract.pytesseract.tesseract_cmd = settings.TESSERACT_PATH
 
-# ── Supported image extensions ────────────────────────────────────────────────
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp", ".webp", ".gif"}
 
 
@@ -27,7 +27,7 @@ def _is_image(path: Path) -> bool:
 
 
 def _image_to_pdf(image_path: Path) -> Path:
-    """Convert image to single-page PDF (used only for searchable PDF output)."""
+    """Convert image to single-page PDF (only for searchable PDF output)."""
     with Image.open(image_path) as img:
         if img.mode in ("RGBA", "P"):
             img = img.convert("RGB")
@@ -49,7 +49,7 @@ class OCRService:
     ) -> list[dict]:
         t0 = time.time()
 
-        # ── IMAGE INPUT: run Tesseract directly — no PDF overhead ─────────────
+        # ── IMAGE: run Tesseract directly — no PDF overhead ───────────────────
         if _is_image(pdf_path):
             result = OCRService.ocr_image(pdf_path, language=language)
             logger.info(f"Image OCR (direct) in {_ms(t0)}ms")
@@ -60,19 +60,18 @@ class OCRService:
                 "source": "ocr",
             }]
 
-        # ── PDF INPUT ─────────────────────────────────────────────────────────
+        # ── PDF: page by page ─────────────────────────────────────────────────
         results = []
         matrix = fitz.Matrix(dpi / 72, dpi / 72)
 
         with fitz.open(pdf_path) as doc:
             target = [p - 1 for p in pages] if pages else range(doc.page_count)
-
             for i in target:
                 if not (0 <= i < doc.page_count):
                     continue
                 page = doc[i]
 
-                # Try native text first (no OCR needed)
+                # Use native text if available (no OCR needed)
                 native_text = page.get_text().strip()
                 if native_text and len(native_text) > 50:
                     results.append({
@@ -83,7 +82,7 @@ class OCRService:
                     })
                     continue
 
-                # Render page → OCR
+                # Render page → image → OCR
                 pix = page.get_pixmap(matrix=matrix, alpha=False)
                 img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
                 del pix  # free immediately
@@ -100,13 +99,12 @@ class OCRService:
                     w for w, c in zip(data["text"], data["conf"])
                     if w.strip() and int(c) > 20
                 ]
-                page_text = " ".join(words)
                 valid_confs = [int(c) for c in data["conf"] if int(c) > 0]
                 avg_conf = (sum(valid_confs) / len(valid_confs) / 100) if valid_confs else 0.0
 
                 results.append({
                     "page": i + 1,
-                    "text": page_text,
+                    "text": " ".join(words),
                     "confidence": round(avg_conf, 3),
                     "source": "ocr",
                 })
@@ -135,39 +133,67 @@ class OCRService:
     def extract_to_searchable_pdf(
         pdf_path: Path, language: str = "heb+eng", dpi: int = 200
     ) -> Path:
-        """Create searchable PDF. For images, converts to PDF first."""
+        """
+        Create a searchable PDF with invisible OCR text layer.
+        Images: OCR directly → create PDF → add text layer (no double rendering)
+        PDFs: OCR page by page → add text layer
+        """
         t0 = time.time()
-
-        # For image input: convert to PDF first, then add OCR layer
         is_img = _is_image(pdf_path)
-        actual_path = _image_to_pdf(pdf_path) if is_img else pdf_path
 
-        try:
-            results = OCRService.extract_text(actual_path, language=language, dpi=dpi)
-            text_by_page = {r["page"]: r["text"] for r in results}
+        # ── IMAGE INPUT ───────────────────────────────────────────────────────
+        if is_img:
+            # Step 1: OCR directly on the image (no PDF conversion yet)
+            result = OCRService.ocr_image(pdf_path, language=language)
+            ocr_text = result["text"]
 
-            with fitz.open(actual_path) as doc:
-                for page_num, text in text_by_page.items():
-                    if not text.strip():
-                        continue
-                    try:
-                        doc[page_num - 1].insert_text(
-                            fitz.Point(10, 20),
-                            text,
-                            fontsize=1,
-                            color=(1, 1, 1),
-                            overlay=False,
-                        )
-                    except Exception as e:
-                        logger.warning(f"insert_text failed page {page_num}: {e}")
-
-                out = _temp_pdf("searchable")
-                doc.save(out, deflate=True)
-        finally:
-            if is_img and actual_path.exists():
+            # Step 2: create PDF from image
+            actual_path = _image_to_pdf(pdf_path)
+            try:
+                with fitz.open(actual_path) as doc:
+                    if ocr_text.strip():
+                        try:
+                            doc[0].insert_text(
+                                fitz.Point(10, 20),
+                                ocr_text,
+                                fontsize=1,
+                                color=(1, 1, 1),
+                                overlay=False,
+                            )
+                        except Exception as e:
+                            logger.warning(f"insert_text failed: {e}")
+                    out = _temp_pdf("searchable")
+                    doc.save(out, deflate=True)
+            finally:
                 actual_path.unlink(missing_ok=True)
-            gc.collect()
+                gc.collect()
 
+            logger.info(f"Searchable PDF (image) in {_ms(t0)}ms")
+            return out
+
+        # ── PDF INPUT ─────────────────────────────────────────────────────────
+        results = OCRService.extract_text(pdf_path, language=language, dpi=dpi)
+        text_by_page = {r["page"]: r["text"] for r in results}
+
+        with fitz.open(pdf_path) as doc:
+            for page_num, text in text_by_page.items():
+                if not text.strip():
+                    continue
+                try:
+                    doc[page_num - 1].insert_text(
+                        fitz.Point(10, 20),
+                        text,
+                        fontsize=1,
+                        color=(1, 1, 1),
+                        overlay=False,
+                    )
+                except Exception as e:
+                    logger.warning(f"insert_text failed page {page_num}: {e}")
+
+            out = _temp_pdf("searchable")
+            doc.save(out, deflate=True)
+
+        gc.collect()
         logger.info(f"Searchable PDF in {_ms(t0)}ms")
         return out
 
@@ -180,8 +206,8 @@ class OCRService:
         from docx.enum.text import WD_ALIGN_PARAGRAPH
 
         results = OCRService.extract_text(pdf_path, language=language, dpi=dpi)
-
         doc = Document()
+
         title = doc.add_heading("מסמך מחולץ — OCR", level=1)
         title.alignment = WD_ALIGN_PARAGRAPH.RIGHT
 
@@ -201,11 +227,14 @@ class OCRService:
 
     @staticmethod
     def ocr_image(image_path: Path, language: str = "heb+eng") -> dict:
-        """Run Tesseract directly on an image file — no PDF conversion."""
+        """
+        Run Tesseract directly on an image file.
+        Resizes large images to save memory.
+        """
         t0 = time.time()
 
         with Image.open(image_path) as img:
-            # Resize if too large (saves memory)
+            # Resize if too large (saves significant memory)
             max_px = 3000
             if max(img.width, img.height) > max_px:
                 ratio = max_px / max(img.width, img.height)
