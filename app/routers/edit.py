@@ -115,20 +115,21 @@ async def sign_pdf(
             rect = fitz.Rect(sig_x, sig_y, sig_x + sig_w, sig_y + sig_h)
             pg.draw_rect(rect, color=(0, 0, 0.6), width=0.5)
 
-            # Signature text in blue (simulates handwriting)
-            pg.insert_text(
-                fitz.Point(sig_x + 6, sig_y + sig_h - 10),
-                signature_text,
-                fontsize=18,
-                color=(0, 0, 0.7),
+            # Signature text in blue. insert_htmlbox handles Hebrew/Arabic fonts and RTL order
+            # (insert_text's built-in font has no Hebrew glyphs and renders dots).
+            import html as _html
+            pg.insert_htmlbox(
+                fitz.Rect(sig_x + 4, sig_y + 2, sig_x + sig_w - 4, sig_y + sig_h - 2),
+                f'<div dir="auto" style="font-size:18px;color:#0000b3;text-align:center">'
+                f'{_html.escape(signature_text, quote=False)}</div>',
             )
 
-            # Date line
+            # Date under the box
             from datetime import datetime
             date_str = datetime.now().strftime("%d/%m/%Y")
             pg.insert_text(
-                fitz.Point(sig_x + 6, sig_y + sig_h + 14),
-                f"תאריך: {date_str}",
+                fitz.Point(sig_x + 6, sig_y + sig_h + 12),
+                date_str,
                 fontsize=8,
                 color=(0.4, 0.4, 0.4),
             )

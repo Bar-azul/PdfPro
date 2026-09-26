@@ -8,6 +8,7 @@ Handles: merge, split, compress, rotate, watermark, password, redact.
 import io
 import logging
 import re
+import secrets
 import tempfile
 import time
 from pathlib import Path
@@ -175,7 +176,8 @@ class PDFService:
             target_pages = [p - 1 for p in pages] if pages else range(doc.page_count)
             for i in target_pages:
                 if 0 <= i < doc.page_count:
-                    doc[i].set_rotation(angle)
+                    # relative to the current rotation (scans often already carry /Rotate)
+                    doc[i].set_rotation((doc[i].rotation + angle) % 360)
             out = _temp_pdf("rotated")
             doc.save(out, deflate=True)
         logger.info(f"Rotated {angle}° in {_ms(t0)}ms")
@@ -194,30 +196,43 @@ class PDFService:
         position: str = "center",
         pages: list[int] | None = None,
     ) -> Path:
+        """Diagonal text watermark. Supports Hebrew/Arabic (RTL) and any rotation angle.
+
+        The text is rendered once with insert_htmlbox (font fallback + bidi), then
+        stamped onto each page with show_pdf_page, which accepts arbitrary angles.
+        """
         t0 = time.time()
+        opacity = max(0.05, min(float(opacity), 1.0))
+        hex_color = "#%02x%02x%02x" % tuple(int(max(0, min(c, 1)) * 255) for c in color)
+
+        stamp = fitz.open()
+        sp = stamp.new_page(width=3000, height=font_size * 3)
+        sp.insert_htmlbox(
+            sp.rect,
+            f'<div dir="auto" style="font-size:{font_size}px;color:{hex_color};'
+            f'white-space:nowrap;text-align:center;font-weight:bold">{_html_escape(text)}</div>',
+            opacity=opacity,
+        )
+        clip = fitz.Rect()
+        for b in sp.get_text("blocks"):
+            clip |= fitz.Rect(b[:4])
+        if clip.is_empty:
+            raise ValueError("Watermark text could not be rendered")
+        clip = (clip + (-4, -4, 4, 4)) & sp.rect
+
         with fitz.open(pdf_path) as doc:
             target = [p - 1 for p in pages] if pages else range(doc.page_count)
             for i in target:
                 if 0 <= i < doc.page_count:
                     page = doc[i]
-                    rect = page.rect
-                    # Center point
-                    cx = rect.width / 2
-                    cy = rect.height / 2
-
-                    # Insert text as a transparent annotation
-                    page.insert_text(
-                        fitz.Point(cx - font_size * len(text) * 0.3, cy),
-                        text,
-                        fontsize=font_size,
-                        color=color,
-                        rotate=rotation,
-                        render_mode=0,
-                        overlay=True,
-                    )
-
+                    r = page.rect
+                    box = fitz.Rect(r.x0 + r.width * 0.08, r.y0 + r.height * 0.08,
+                                    r.x1 - r.width * 0.08, r.y1 - r.height * 0.08)
+                    # show_pdf_page rotates counter-clockwise; the API's rotation is clockwise-negative
+                    page.show_pdf_page(box, stamp, 0, clip=clip, rotate=-rotation, overlay=True)
             out = _temp_pdf("watermarked")
             doc.save(out, deflate=True)
+        stamp.close()
         logger.info(f"Watermark added in {_ms(t0)}ms")
         return out
 
@@ -264,7 +279,8 @@ class PDFService:
     ) -> Path:
         """Encrypt PDF with a user password."""
         t0 = time.time()
-        owner_pw = owner_password or password + "_owner"
+        # random owner password: knowing the open password must not unlock the permissions
+        owner_pw = owner_password or secrets.token_urlsafe(24)
 
         perm = fitz.PDF_PERM_ACCESSIBILITY
         if allow_print:
@@ -392,6 +408,11 @@ class PDFService:
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
+
+def _html_escape(text: str) -> str:
+    import html
+    return html.escape(text or "", quote=False)
+
 
 def _temp_pdf(prefix: str) -> Path:
     import uuid
