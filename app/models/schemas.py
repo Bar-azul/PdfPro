@@ -20,6 +20,12 @@ class FileResult(BaseModel):
     processing_time_ms: int
 
 
+class CompressResult(FileResult):
+    """FileResult plus how much the compression saved."""
+    original_size_bytes: int
+    saved_percentage: float
+
+
 class ErrorDetail(BaseModel):
     detail: str
     code: str | None = None

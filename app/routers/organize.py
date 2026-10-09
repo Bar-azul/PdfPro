@@ -10,7 +10,7 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, Request, File, Form, Query, UploadFile
 
 from ..middleware.rate_limit import limiter
-from ..models.schemas import CompressRequest, FileResult, MergeRequest, RotateRequest, SplitRequest, SplitResult
+from ..models.schemas import CompressRequest, CompressResult, FileResult, MergeRequest, RotateRequest, SplitRequest, SplitResult
 from .auth import get_optional_user
 from ..services.pdf_service import PDFService
 from ..services.storage_service import StorageService
@@ -123,7 +123,7 @@ async def split_pdf(
 
 # ── Compress ───────────────────────────────────────────────────────────────────
 
-@router.post("/compress", response_model=FileResult, summary="Compress a PDF")
+@router.post("/compress", response_model=CompressResult, summary="Compress a PDF")
 @limiter.limit("20/hour")
 async def compress_pdf(
     request: Request,
@@ -134,11 +134,12 @@ async def compress_pdf(
     """
     Reduce PDF file size by recompressing images and cleaning the document structure.
 
-    Compression levels:
-    - **low** → ~10% reduction, near-lossless
-    - **medium** → ~40% reduction, minimal quality loss
-    - **high** → ~65% reduction, visible on images
-    - **extreme** → ~80% reduction, best for text-only documents
+    Compression levels (images shown above the DPI threshold are downsampled, then JPEG-encoded):
+    - **low** → above 300 dpi → 220 dpi, quality 85
+    - **medium** → above 200 dpi → 150 dpi, quality 75
+    - **high** → above 150 dpi → 120 dpi, quality 60
+    - **extreme** → above 120 dpi → 96 dpi, quality 45
+    Text and vector graphics are never changed; if nothing can be saved the original is returned.
     """
     t0 = time.time()
     if level not in ("low", "medium", "high", "extreme"):

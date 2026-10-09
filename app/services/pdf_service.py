@@ -7,6 +7,7 @@ Handles: merge, split, compress, rotate, watermark, password, redact.
 
 import io
 import logging
+import math
 import re
 import secrets
 import tempfile
@@ -15,22 +16,23 @@ from pathlib import Path
 from typing import Literal
 
 import fitz  # PyMuPDF
+from PIL import Image
 
 from ..config import settings
 
 logger = logging.getLogger(__name__)
 
 # ── Compression settings ──────────────────────────────────────────────────────
-COMPRESS_PRESETS = {
-    "low":     {"deflate": True, "clean": True, "garbage": 1, "linear": False},
-    "medium":  {"deflate": True, "clean": True, "garbage": 2, "linear": True},
-    "high":    {"deflate": True, "clean": True, "garbage": 3, "linear": True},
-    "extreme": {"deflate": True, "clean": True, "garbage": 4, "linear": True},
+# (dpi_threshold, dpi_target, jpeg_quality): images shown above the threshold are
+# downsampled to the target resolution, then re-encoded as JPEG at that quality.
+# Higher level = smaller file. Text and vector graphics are never touched.
+COMPRESS_LEVELS = {
+    "low":     (300, 220, 85),
+    "medium":  (200, 150, 75),
+    "high":    (150, 120, 60),
+    "extreme": (120, 96, 45),
 }
-
-IMAGE_QUALITY = {
-    "low": 40, "medium": 60, "high": 40, "extreme": 25,
-}
+COMPRESS_MIN_IMAGE_BYTES = 20_000   # icons and small logos aren't worth re-encoding
 
 
 class PDFService:
@@ -122,42 +124,42 @@ class PDFService:
 
     @staticmethod
     def compress(pdf_path: Path, level: str = "medium") -> Path:
-        """Compress a PDF by downsampling images and cleaning the file."""
+        """Shrink a PDF by downsampling and re-encoding its images.
+
+        Each image is decoded with its real colour space (RGB, gray, CMYK, ICC, inverted
+        CMYK), downsampled only if it's shown above the level's DPI threshold, and stored
+        as a plain JPEG with a matching image dictionary. Images with transparency,
+        stencil masks or 1-bit scans are left untouched. If the result isn't smaller,
+        or loses pages, the original file is returned unchanged.
+        """
         t0 = time.time()
-        preset = COMPRESS_PRESETS.get(level, COMPRESS_PRESETS["medium"])
-        quality = IMAGE_QUALITY.get(level, 60)
+        threshold, target, quality = COMPRESS_LEVELS.get(level, COMPRESS_LEVELS["medium"])
+        out = _temp_pdf("compressed")
 
         with fitz.open(pdf_path) as doc:
-            # Recompress embedded images
+            page_count = doc.page_count
+            widths = _image_display_widths(doc)
+            seen: set[int] = set()
             for page in doc:
-                image_list = page.get_images(full=True)
-                for img in image_list:
-                    xref = img[0]
+                for item in page.get_images(full=True):
+                    xref = item[0]
+                    if xref in seen:            # shared images (a logo on every page) once only
+                        continue
+                    seen.add(xref)
                     try:
-                        base_img = doc.extract_image(xref)
-                        img_bytes = base_img["image"]
-                        from PIL import Image
+                        _recompress_image(doc, xref, widths.get(xref), threshold, target, quality)
+                    except Exception as exc:    # leave that image exactly as it was
+                        logger.warning(f"compress: skipped image xref {xref}: {exc}")
+                    fitz.TOOLS.store_shrink(100)  # drop MuPDF's decoded-image cache, keeps memory flat
+            doc.save(out, garbage=3, deflate=True, use_objstms=1)
 
-                        pil_img = Image.open(io.BytesIO(img_bytes))
-                        if pil_img.mode in ("RGBA", "P"):
-                            pil_img = pil_img.convert("RGB")
-
-                        buf = io.BytesIO()
-                        pil_img.save(buf, format="JPEG", quality=quality, optimize=True)
-                        doc.update_stream(xref, buf.getvalue())
-                    except Exception:
-                        pass  # Skip images we can't recompress
-
-            out = _temp_pdf("compressed")
-            doc.save(
-                out,
-                deflate=preset["deflate"],
-                clean=preset["clean"],
-                garbage=preset["garbage"],
-                linear=preset["linear"],
-            )
-
+        with fitz.open(out) as check:
+            pages_ok = check.page_count == page_count
         original_size = pdf_path.stat().st_size
+        if not pages_ok or out.stat().st_size >= original_size:
+            import shutil
+            shutil.copyfile(pdf_path, out)      # never hand back something broken or bigger
+
         compressed_size = out.stat().st_size
         ratio = (1 - compressed_size / original_size) * 100 if original_size else 0
         logger.info(
@@ -165,8 +167,6 @@ class PDFService:
             f"({ratio:.1f}% reduction) in {_ms(t0)}ms"
         )
         return out
-
-    # ── Rotate ─────────────────────────────────────────────────────────────────
 
     @staticmethod
     def rotate(pdf_path: Path, angle: int, pages: list[int] | None = None) -> Path:
@@ -328,7 +328,7 @@ class PDFService:
     ) -> Path:
         """Black-out all occurrences of the given text strings."""
         t0 = time.time()
-        flags = 0 if case_sensitive else fitz.TEXT_SEARCH_IGNORECASE
+        # search_for() is case-insensitive; for case-sensitive requests keep only exact hits.
         total_redactions = 0
 
         with fitz.open(pdf_path) as doc:
@@ -338,6 +338,8 @@ class PDFService:
                     page = doc[i]
                     for text in texts:
                         rects = page.search_for(text, quads=False)
+                        if case_sensitive:
+                            rects = [r for r in rects if text in page.get_textbox(r + (-1, -1, 1, 1))]
                         for rect in rects:
                             page.add_redact_annot(rect, fill=(0, 0, 0))
                             total_redactions += 1
@@ -408,6 +410,106 @@ class PDFService:
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
+
+# ── Compression helpers ───────────────────────────────────────────────────────
+
+def _image_display_widths(doc):
+    """xref -> largest width (in points) the image is drawn at anywhere in the document.
+    The largest placement needs the most pixels, so it decides how far we may downsample.
+    Uses get_image_info() without hashes, which doesn't decode the images (cheap on big scans);
+    placements are matched to xrefs by pixel size."""
+    widths = {}
+    for page in doc:
+        by_size = {}
+        for item in page.get_images(full=True):
+            by_size.setdefault((item[2], item[3]), []).append(item[0])
+        for info in page.get_image_info():
+            a, b = info["transform"][0], info["transform"][1]
+            shown = (a * a + b * b) ** 0.5          # drawn width of the image's x axis, handles rotation
+            for xref in by_size.get((info["width"], info["height"]), []):
+                widths[xref] = max(widths.get(xref, 0.0), shown)
+    return widths
+
+
+def _scale_for(width_px, shown_width_pt, threshold, target):
+    dpi = width_px / (shown_width_pt / 72.0)
+    return target / dpi if dpi > threshold else 1.0
+
+
+def _finish(img, scale):
+    if scale < 0.98:
+        size = (max(1, round(img.width * scale)), max(1, round(img.height * scale)))
+        if img.size != size:
+            img = img.resize(size, Image.LANCZOS)
+    return img
+
+
+def _decode_jpeg_scaled(doc, xref, shown_width_pt, threshold, target):
+    """Plain RGB/gray JPEGs (most scans and photos): let libjpeg decode straight to a smaller
+    size (draft mode), so a 600 dpi page never has to sit in memory at full resolution."""
+    if doc.xref_get_key(xref, "Filter")[1] != "/DCTDecode" or doc.xref_get_key(xref, "Decode")[0] != "null":
+        return None
+    img = Image.open(io.BytesIO(doc.xref_stream_raw(xref)))
+    if img.mode not in ("RGB", "L"):
+        return None                          # CMYK/YCCK JPEGs go through MuPDF
+    scale = _scale_for(img.width, shown_width_pt, threshold, target)
+    w, h = img.size
+    if scale < 0.98:
+        img.draft(img.mode, (int(w * scale) + 1, int(h * scale) + 1))
+    img.load()
+    return _finish(img, scale * w / img.width)
+
+
+def _decode_with_mupdf(doc, xref, shown_width_pt, threshold, target):
+    pix = fitz.Pixmap(doc, xref)            # Flate/JPX/CMYK/ICC/Decode arrays, decoded by MuPDF
+    if pix.alpha:
+        return None
+    if pix.colorspace is None or pix.colorspace.n not in (1, 3):
+        pix = fitz.Pixmap(fitz.csRGB, pix)   # CMYK, Lab, etc. -> RGB
+    scale = _scale_for(pix.width, shown_width_pt, threshold, target)
+    if scale < 0.5:                          # cheap power-of-two shrink first, keeps memory low
+        n = int(math.floor(math.log2(1 / scale)))
+        pix.shrink(n)
+        scale *= 2 ** n
+    mode = "L" if pix.n == 1 else "RGB"
+    # frombuffer shares the pixmap's memory instead of copying it
+    img = Image.frombuffer(mode, (pix.width, pix.height), pix.samples_mv, "raw", mode, pix.stride, 1)
+    img = _finish(img, scale)
+    return img.copy() if img.size == (pix.width, pix.height) else img
+
+
+def _recompress_image(doc, xref, shown_width_pt, threshold, target, quality):
+    obj = doc.xref_object(xref, compressed=True)
+    # Leave alone anything we can't faithfully re-encode: masks/transparency, stencils, 1-bit scans.
+    if any(k in obj for k in ("/SMask", "/Mask", "/ImageMask")):
+        return
+    if "/BitsPerComponent 1" in obj.replace("\n", " "):
+        return
+    raw_len = len(doc.xref_stream_raw(xref) or b"")
+    if raw_len < COMPRESS_MIN_IMAGE_BYTES:
+        return
+    if not shown_width_pt:                   # image not placed on any page
+        return
+    img = _decode_jpeg_scaled(doc, xref, shown_width_pt, threshold, target)
+    if img is None:
+        img = _decode_with_mupdf(doc, xref, shown_width_pt, threshold, target)
+    if img is None:
+        return
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=quality, optimize=True)
+    data = buf.getvalue()
+    if len(data) >= raw_len:                 # never make an image bigger
+        return
+    doc.update_stream(xref, data, compress=False)
+    doc.xref_set_key(xref, "Filter", "/DCTDecode")
+    doc.xref_set_key(xref, "DecodeParms", "null")
+    doc.xref_set_key(xref, "Decode", "null")      # the pixmap already has any Decode array applied (e.g. inverted CMYK)
+    doc.xref_set_key(xref, "ColorSpace", "/DeviceGray" if img.mode == "L" else "/DeviceRGB")
+    doc.xref_set_key(xref, "BitsPerComponent", "8")
+    doc.xref_set_key(xref, "Width", str(img.width))
+    doc.xref_set_key(xref, "Height", str(img.height))
+
+
 
 def _html_escape(text: str) -> str:
     import html

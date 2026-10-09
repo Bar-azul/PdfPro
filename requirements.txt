@@ -11,7 +11,7 @@ psycopg2-binary==2.9.10
 alembic==1.14.0
 
 # ── PDF processing ─────────────────────────────────────────────────────────────
-PyMuPDF>=1.25.0
+PyMuPDF==1.28.2   # pinned: 1.25+ removed linearised saves; upgrade only after re-testing compress/sign/watermark
 pdf2docx==0.5.8
 pdfplumber==0.11.4
 reportlab==4.2.2
