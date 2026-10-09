@@ -27,10 +27,12 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp", ".webp", ".gif"}
 
 
 def _is_image(path: Path) -> bool:
+    """True for uploads that are image files rather than PDFs."""
     return path.suffix.lower() in IMAGE_EXTS
 
 
 def _image_to_pdf(image_path: Path) -> Path:
+    """Wrap an uploaded image (EXIF orientation applied) in a one-page PDF."""
     from PIL import ImageOps
     with Image.open(image_path) as raw:
         img = ImageOps.exif_transpose(raw)
@@ -88,6 +90,7 @@ def _invisible_text_spans(page: "fitz.Page") -> tuple[int, list]:
 
 
 def _needs_ocr(page: "fitz.Page") -> bool:
+    """True when the page has no real visible text (a scan, maybe with an invisible OCR layer)."""
     visible, _ = _invisible_text_spans(page)
     return visible <= 50
 
@@ -113,6 +116,7 @@ def _data_to_text(data: dict) -> str:
 
 
 def _confidence(data: dict) -> float:
+    """Mean Tesseract word confidence for a page, 0–1."""
     confs = [float(c) for w, c in zip(data["text"], data["conf"]) if w.strip() and float(c) >= 0]
     return round(sum(confs) / len(confs) / 100, 3) if confs else 0.0
 
@@ -124,6 +128,7 @@ _BIDI_MARKS = dict.fromkeys(map(ord, "\u200e\u200f\u202a\u202b\u202c\u202d\u202e
 
 
 def _box(d: dict, i: int) -> tuple:
+    """Bounding box (x0, y0, x1, y1) of word i in Tesseract output."""
     return (d["left"][i], d["top"][i], d["left"][i] + d["width"][i], d["top"][i] + d["height"][i])
 
 
@@ -321,6 +326,7 @@ class OCRService:
         dpi: int = 200,
         pages: list[int] | None = None,
     ) -> list[dict]:
+        """OCR a PDF or image → one {page, text, confidence, source} per page; real text is kept as is."""
         t0 = time.time()
 
         # ── IMAGE: direct Tesseract — no PDF overhead ─────────────────────────
@@ -373,6 +379,7 @@ class OCRService:
     def extract_to_txt(
         pdf_path: Path, language: str = "heb+eng", dpi: int = 200
     ) -> Path:
+        """OCR to a UTF-8 .txt file with a header per page."""
         results = OCRService.extract_text(pdf_path, language=language, dpi=dpi)
         out = _temp_file("ocr_output", ".txt")
         lines = []
@@ -442,6 +449,7 @@ class OCRService:
     def extract_to_docx(
         pdf_path: Path, language: str = "heb+eng", dpi: int = 200
     ) -> Path:
+        """OCR to a Word file: one paragraph per line, RTL paragraphs for Hebrew/Arabic, a page break per page."""
         from docx import Document
         from docx.shared import Pt
         from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -453,6 +461,7 @@ class OCRService:
         doc = Document()
 
         def add_par(text: str, size: int = 12, bold: bool = False):
+            """Add one paragraph, set right-to-left when it contains Hebrew/Arabic."""
             rtl = bool(_RTL_CHARS.search(text))
             para = doc.add_paragraph()
             if rtl:
@@ -513,6 +522,7 @@ class OCRService:
 
     @staticmethod
     def get_available_languages() -> list[str]:
+        """Installed Tesseract language codes (without the orientation model)."""
         try:
             langs = pytesseract.get_languages(config="")
             return [l for l in langs if l != "osd"]
