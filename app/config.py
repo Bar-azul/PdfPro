@@ -54,6 +54,13 @@ class Settings(BaseSettings):
     TESSERACT_PATH: str = "/usr/bin/tesseract"
     OCR_LANGUAGES: list[str] = ["heb", "eng", "ara"]
 
+    # ── Translation (official APIs; the free Google web endpoints block cloud IPs)
+    AZURE_TRANSLATOR_KEY: str = ""
+    AZURE_TRANSLATOR_REGION: str = ""      # e.g. "westeurope"; needed for regional resources
+    GOOGLE_TRANSLATE_API_KEY: str = ""     # Cloud Translation API (v2) key
+    CLOUDFLARE_ACCOUNT_ID: str = ""        # Workers AI (m2m100) — free daily allowance, no card
+    CLOUDFLARE_API_TOKEN: str = ""
+
     @field_validator("UPLOAD_DIR", "OUTPUT_DIR", mode="before")
     @classmethod
     def ensure_path(cls, v):
