@@ -97,8 +97,17 @@ async def split_pdf(
             PDFService.split_every_n, upload_meta["path"], every_n
         )
     elif mode == "pages":
-        page_list = [int(p) for p in (pages or "").split(",") if p.strip().isdigit()]
-        PDFService.check_ranges(upload_meta["path"], [str(p) for p in page_list] or [pages or ""])
+        # validate every entry, so "1,abc" is an error instead of silently dropping "abc";
+        # ranges such as "2-4" are accepted here too
+        raw = [p.strip() for p in (pages or "").split(",") if p.strip()]
+        PDFService.check_ranges(upload_meta["path"], raw or [""])
+        import fitz
+        with fitz.open(upload_meta["path"]) as _doc:
+            total = _doc.page_count
+        page_list = []
+        for entry in raw:
+            start, _, end = entry.replace(" ", "").partition("-")
+            page_list.extend(range(int(start), min(int(end or start), total) + 1))
         result_paths = [
             await asyncio.to_thread(PDFService.extract_pages, upload_meta["path"], page_list)
         ]
