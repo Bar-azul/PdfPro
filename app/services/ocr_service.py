@@ -139,67 +139,144 @@ def _overlap(a: tuple, b: tuple) -> float:
     return w * h / max(1, (a[2] - a[0]) * (a[3] - a[1]))
 
 
-def _fix_latin_misreads(mixed: dict, rtl_only: dict) -> int:
+def _latin_suspects(mixed: dict) -> list[int]:
     """
     With heb+eng, Tesseract regularly reads a Hebrew word as Latin junk
-    ("ביום" → "ova", "עם" → "OY"). For Latin-only words inside mostly-Hebrew
-    lines, take the Hebrew-only reading of the same spot when it is more
-    confident. Real English words (emails, URLs, names read confidently) stay.
-    Edits `mixed` in place; returns how many words were replaced.
+    ("ביום" → "ova", "עם" → "OY"). Suspects: Latin-only, not very confident
+    words inside mostly-Hebrew lines. Emails/URLs and English lines are left out.
     """
     lines: dict[tuple, list[int]] = {}
     for i, w in enumerate(mixed["text"]):
         if w.strip() and float(mixed["conf"][i]) >= 0:
             lines.setdefault((mixed["block_num"][i], mixed["par_num"][i], mixed["line_num"][i]), []).append(i)
-    rtl_words = [j for j, w in enumerate(rtl_only["text"]) if w.strip() and float(rtl_only["conf"][j]) >= 0]
-    replaced = 0
+    out = []
     for idx in lines.values():
         rtl_count = sum(bool(_HEB_ARA.search(mixed["text"][i])) for i in idx)
         if rtl_count * 2 < len(idx):
-            continue  # an English line: leave it to the English model
+            continue
         for i in idx:
             word, conf = mixed["text"][i], float(mixed["conf"][i])
             if not _LATIN.search(word) or _HEB_ARA.search(word) or conf >= 90:
                 continue
             if "@" in word or "www" in word.lower() or "://" in word:
                 continue
-            b = _box(mixed, i)
-            cand = [j for j in rtl_words
-                    if _overlap(b, _box(rtl_only, j)) > 0.5 or _overlap(_box(rtl_only, j), b) > 0.5]
-            if not cand:
-                continue
-            cand_conf = sum(float(rtl_only["conf"][j]) for j in cand) / len(cand)
-            text = " ".join(rtl_only["text"][j].strip() for j in cand)
-            if cand_conf > conf and _HEB_ARA.search(text):
-                mixed["text"][i] = text
-                mixed["conf"][i] = cand_conf
-                replaced += 1
+            out.append(i)
+    return out
+
+
+def _fix_latin_misreads(img: Image.Image, mixed: dict, rtl_lang: str) -> int:
+    """
+    Re-read only the suspect words with the Hebrew/Arabic-only model. The word
+    crops are stacked into one small image so this is a single, fast Tesseract
+    call (a full second page pass cost ~30% of the OCR time on the server).
+    A reading replaces the Latin one when it is more confident. Edits `mixed`
+    in place; returns how many words were replaced.
+    """
+    suspects = _latin_suspects(mixed)
+    if not suspects:
+        return 0
+    crops, bands, y = [], [], 0
+    for i in suspects:
+        x0, y0, x1, y1 = _box(mixed, i)
+        h = max(8, y1 - y0)
+        box = (max(0, x0 - h // 4), max(0, y0 - h // 3), min(img.width, x1 + h // 4), min(img.height, y1 + h // 3))
+        crop = img.crop(box)
+        crops.append((crop, y))
+        bands.append((y, y + crop.height))
+        y += crop.height + h  # a blank gap so lines don't merge
+    width = max(c.width for c, _ in crops) + 40
+    sheet = Image.new("L", (width, y + 20), 255)
+    for crop, top in crops:
+        sheet.paste(crop, (width - crop.width - 20, top + 10))  # right-aligned, like RTL text
+    bands = [(t + 10, b + 10) for t, b in bands]
+    rtl = pytesseract.image_to_data(sheet, lang=rtl_lang, config="--oem 3 --psm 6",
+                                    output_type=pytesseract.Output.DICT)
+    per_band: dict[int, list[int]] = {}
+    for j, w in enumerate(rtl["text"]):
+        if not w.strip() or float(rtl["conf"][j]) < 0:
+            continue
+        cy = rtl["top"][j] + rtl["height"][j] / 2
+        for k, (t, b) in enumerate(bands):
+            if t - 2 <= cy <= b + 2:
+                per_band.setdefault(k, []).append(j)
+                break
+    replaced = 0
+    for k, i in enumerate(suspects):
+        cand = per_band.get(k)
+        if not cand:
+            continue
+        cand_conf = sum(float(rtl["conf"][j]) for j in cand) / len(cand)
+        text = " ".join(rtl["text"][j].strip() for j in cand)
+        if cand_conf > float(mixed["conf"][i]) and _HEB_ARA.search(text):
+            mixed["text"][i] = text
+            mixed["conf"][i] = cand_conf
+            replaced += 1
     return replaced
 
 
+def _looks_upright(data: dict) -> bool:
+    """
+    Upright text reads with mean confidence ~80-90; upside-down pages ~40-50.
+    Tesseract can also read a sideways page fairly well, but then its word boxes
+    are tall and narrow — the text layer would run across the lines — so that
+    counts as not upright too.
+    """
+    words = [i for i, (w, c) in enumerate(zip(data["text"], data["conf"]))
+             if w.strip() and float(c) >= 0]
+    if len(words) < 5:
+        return False
+    mean_conf = sum(float(data["conf"][i]) for i in words) / len(words)
+    long_words = [i for i in words if len(data["text"][i].strip()) >= 4]
+    tall = sum(data["height"][i] > data["width"][i] for i in long_words)
+    return mean_conf >= 65 and not (long_words and tall * 2 > len(long_words))
+
+
 def _ocr_pil(img: Image.Image, language: str):
-    """Prepare (rotate/enhance) and OCR one image → (prepared image, osd angle, data)."""
-    img, angle = _prepare_image(img, with_angle=True)
-    data = pytesseract.image_to_data(
-        img, lang=language, config="--oem 3 --psm 3",
-        output_type=pytesseract.Output.DICT,
-    )
+    """
+    Enhance and OCR one image → (prepared image, rotation applied, data).
+    Orientation detection (a separate Tesseract run) only happens when the
+    first read looks like a sideways or upside-down page.
+    """
+    img = _prepare_image(img, detect_rotation=False)
+    config = "--oem 3 --psm 3"
+    data = pytesseract.image_to_data(img, lang=language, config=config,
+                                     output_type=pytesseract.Output.DICT)
+    angle = 0
+    if not _looks_upright(data):
+        angle = _detect_rotation(img)
+        if angle:
+            img = img.rotate(-angle, expand=True)
+            logger.info(f"Auto-rotated page by {angle}°")
+            data = pytesseract.image_to_data(img, lang=language, config=config,
+                                             output_type=pytesseract.Output.DICT)
     langs = language.split("+")
     rtl = [l for l in langs if l in _RTL_LANGS]
     if rtl and len(rtl) < len(langs):
-        rtl_data = pytesseract.image_to_data(
-            img, lang="+".join(rtl), config="--oem 3 --psm 3",
-            output_type=pytesseract.Output.DICT,
-        )
-        n = _fix_latin_misreads(data, rtl_data)
+        n = _fix_latin_misreads(img, data, "+".join(rtl))
         if n:
-            logger.info(f"OCR: {n} Latin misreads replaced from the {'+'.join(rtl)} pass")
+            logger.info(f"OCR: {n} Latin misreads replaced from the {'+'.join(rtl)} re-read")
     # Tesseract sprinkles LRM/RLM marks into RTL output; they break search and copy
     data["text"] = [w.translate(_BIDI_MARKS) for w in data["text"]]
     return img, angle, data
 
 
-def _prepare_image(img: Image.Image, with_angle: bool = False):
+def _detect_rotation(img: Image.Image) -> int:
+    """Tesseract orientation detection on a small copy; 0 unless it is confident."""
+    try:
+        probe = img
+        if max(img.size) > 1500:
+            r = 1500 / max(img.size)
+            probe = img.resize((int(img.width * r), int(img.height * r)), Image.BILINEAR)
+        osd = pytesseract.image_to_osd(probe, output_type=pytesseract.Output.DICT, config="--psm 0")
+        if float(osd.get("orientation_conf", 0)) < 2:
+            return 0
+        return int(osd.get("rotate", 0)) % 360
+    except Exception as e:
+        logger.debug(f"OSD failed (continuing without rotation): {e}")
+        return 0
+
+
+def _prepare_image(img: Image.Image, with_angle: bool = False, detect_rotation: bool = True):
     """
     Prepare image for best OCR accuracy:
     1. Resize if too large
@@ -221,27 +298,10 @@ def _prepare_image(img: Image.Image, with_angle: bool = False):
         img = img.convert("RGB")
 
     # Step 3 — Auto-detect and fix rotation
-    angle = 0
-    try:
-        # orientation needs far less detail than reading: a ~1500 px copy is enough
-        probe = img
-        if max(img.size) > 1500:
-            r = 1500 / max(img.size)
-            probe = img.resize((int(img.width * r), int(img.height * r)), Image.BILINEAR)
-        osd = pytesseract.image_to_osd(
-            probe,
-            output_type=pytesseract.Output.DICT,
-            config="--psm 0",
-        )
-        angle = osd.get("rotate", 0)
-        # a guess on a page with little text can be wrong; only turn the page when sure
-        if float(osd.get("orientation_conf", 0)) < 2:
-            angle = 0
-        if angle and angle != 0:
-            img = img.rotate(-angle, expand=True)
-            logger.info(f"Auto-rotated image by {angle}°")
-    except Exception as e:
-        logger.debug(f"OSD failed (continuing without rotation): {e}")
+    angle = _detect_rotation(img) if detect_rotation else 0
+    if angle:
+        img = img.rotate(-angle, expand=True)
+        logger.info(f"Auto-rotated image by {angle}°")
 
     # Step 4 — Grayscale + enhance
     img = img.convert("L")
