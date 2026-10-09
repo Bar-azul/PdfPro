@@ -231,8 +231,9 @@ _BATCH_CHARS = 1500  # per request; keeps the GET URL well under URL-length limi
 
 class _Translator:
     """
-    Translation routes, best first: Azure AI Translator and Google Cloud
-    Translation when their keys are set (official APIs, work from cloud servers),
+    Translation routes, best first: Azure AI Translator, Google Cloud
+    Translation and Cloudflare Workers AI (m2m100) when their keys are set
+    (official APIs, work from cloud servers),
     then Google's public "gtx" endpoint and deep-translator's page scraper —
     those two are free but Google blocks them from datacenter IPs (Render). One request per block — the old way — gets an
     IP throttled after a few dozen blocks.
@@ -257,6 +258,8 @@ class _Translator:
             routes.append(self._azure)
         if settings.GOOGLE_TRANSLATE_API_KEY:
             routes.append(self._gcloud)
+        if settings.CLOUDFLARE_ACCOUNT_ID and settings.CLOUDFLARE_API_TOKEN:
+            routes.append(self._cloudflare)
         return routes
 
     def _azure(self, texts: list[str]) -> list[str]:
@@ -284,6 +287,31 @@ class _Translator:
         if r.status_code != 200:
             raise RuntimeError(f"gcloud HTTP {r.status_code}: {r.text[:200]}")
         return [html.unescape(t["translatedText"]) for t in r.json()["data"]["translations"]]
+
+    def _cloudflare(self, texts: list[str]) -> list[str]:
+        """
+        Cloudflare Workers AI, model m2m100-1.2b (free daily allowance). One text per
+        call, so calls run a few at a time in parallel. m2m100 needs the source
+        language, so "auto" is detected from the text.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+        url = (f"https://api.cloudflare.com/client/v4/accounts/{settings.CLOUDFLARE_ACCOUNT_ID}"
+               f"/ai/run/@cf/meta/m2m100-1.2b")
+        headers = {"Authorization": f"Bearer {settings.CLOUDFLARE_API_TOKEN}"}
+        target = _m2m_code(self.target)
+
+        def one(text: str) -> str:
+            src = _m2m_code(self.source) if self.source and self.source != "auto" else _detect_lang(text)
+            if src == target:
+                return text
+            r = self._client.post(url, headers=headers,
+                                  json={"text": text, "source_lang": src, "target_lang": target})
+            if r.status_code != 200:
+                raise RuntimeError(f"cloudflare HTTP {r.status_code}: {r.text[:200]}")
+            return r.json()["result"]["translated_text"]
+
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            return list(pool.map(one, texts))
 
     def _try_many(self, texts: list[str]) -> list[str] | None:
         """Batch through the official APIs; None if none is configured or all failed."""
@@ -410,6 +438,34 @@ class _Translator:
             size += n + 1
         flush()
         return results
+
+
+def _m2m_code(code: str) -> str:
+    """Google-style codes → m2m100 codes."""
+    return {"iw": "he", "zh-CN": "zh", "zh-TW": "zh", "jw": "jv"}.get(code, code)
+
+
+_SCRIPTS = [
+    (re.compile(r"[\u0590-\u05FF]"), "he"), (re.compile(r"[\u0600-\u06FF]"), "ar"),
+    (re.compile(r"[\u0E00-\u0E7F]"), "th"), (re.compile(r"[\u0400-\u04FF]"), "ru"),
+    (re.compile(r"[\uAC00-\uD7AF]"), "ko"), (re.compile(r"[\u3040-\u30FF]"), "ja"),
+    (re.compile(r"[\u4E00-\u9FFF]"), "zh"), (re.compile(r"[\u0370-\u03FF]"), "el"),
+]
+
+
+def _detect_lang(text: str) -> str:
+    """Source language for m2m100: by script, then langdetect for Latin-script text."""
+    counts = [(len(rx.findall(text)), code) for rx, code in _SCRIPTS]
+    n, code = max(counts)
+    if n >= 2:
+        return code
+    try:
+        from langdetect import detect, DetectorFactory
+        DetectorFactory.seed = 0
+        found = detect(text)
+        return {"zh-cn": "zh", "zh-tw": "zh"}.get(found, found)
+    except Exception:
+        return "en"
 
 
 def _azure_code(code: str) -> str:
