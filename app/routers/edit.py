@@ -85,17 +85,27 @@ async def add_watermark(
 async def sign_pdf(
     request: Request,
     file: UploadFile = File(...),
-    signature_text: str = Form(..., description="Name or text to render as signature"),
-    x: float = Form(default=0.6, description="Horizontal position (0.0–1.0)"),
-    y: float = Form(default=0.85, description="Vertical position (0.0–1.0)"),
+    signature_text: str | None = Form(default=None, description="Name to render as a typed signature"),
+    signature_image: UploadFile | None = File(default=None, description="Drawn signature (PNG, transparent background)"),
+    x: float = Form(default=0.6, description="Horizontal position of the box's left edge (0.0–1.0)"),
+    y: float = Form(default=0.85, description="Vertical position of the box's top edge (0.0–1.0)"),
     page: int = Form(default=-1, description="Page number (1-based). -1 = last page."),
+    add_date: bool = Form(default=True, description="Print today's date under the signature"),
     user: dict | None = Depends(get_optional_user),
 ):
-    """Add a visual signature to a PDF page."""
+    """Add a visible signature to a PDF page: a drawn signature image, or a typed name."""
     import fitz
+    from fastapi import HTTPException
     t0 = time.time()
 
+    text = (signature_text or "").strip()
+    if signature_image is None and not text:
+        raise HTTPException(400, detail="Provide signature_image or signature_text")
+
     data = await validate_upload(file, allowed_mimes=PDF_ONLY, is_pro=_is_pro(user))
+    img_bytes = None
+    if signature_image is not None:
+        img_bytes = await validate_upload(signature_image, allowed_mimes={"image/png", "image/jpeg"}, max_mb=2)
     upload_meta = await StorageService.save_upload(data, file.filename or "upload.pdf")
 
     def _sign(pdf_path: Path) -> Path:
@@ -105,40 +115,48 @@ async def sign_pdf(
             page_idx = max(0, min(page_idx, doc.page_count - 1))
             pg = doc[page_idx]
 
-            w, h = pg.rect.width, pg.rect.height
-            sig_x = w * x
-            sig_y = h * y
-            sig_w = w * 0.25
-            sig_h = 40
-
-            # Draw signature box
+            r = pg.rect
+            sig_w = r.width * 0.25
+            sig_h = 50 if img_bytes else 40
+            # keep the whole box (and the date line) inside the page
+            sig_x = min(max(r.width * x, 10), r.width - sig_w - 10)
+            sig_y = min(max(r.height * y, 10), r.height - sig_h - 20)
             rect = fitz.Rect(sig_x, sig_y, sig_x + sig_w, sig_y + sig_h)
-            pg.draw_rect(rect, color=(0, 0, 0.6), width=0.5)
 
-            # Signature text in blue. insert_htmlbox handles Hebrew/Arabic fonts and RTL order
-            # (insert_text's built-in font has no Hebrew glyphs and renders dots).
-            import html as _html
-            pg.insert_htmlbox(
-                fitz.Rect(sig_x + 4, sig_y + 2, sig_x + sig_w - 4, sig_y + sig_h - 2),
-                f'<div dir="auto" style="font-size:18px;color:#0000b3;text-align:center">'
-                f'{_html.escape(signature_text, quote=False)}</div>',
-            )
+            if img_bytes:
+                # Drawn signature: placed as-is, no frame, like ink on paper
+                try:
+                    pg.insert_image(rect, stream=img_bytes, keep_proportion=True, overlay=True)
+                except Exception:
+                    raise ValueError("bad_image")
+            else:
+                pg.draw_rect(rect, color=(0, 0, 0.6), width=0.5)
+                # insert_htmlbox handles Hebrew/Arabic fonts and RTL order
+                # (insert_text's built-in font has no Hebrew glyphs and renders dots).
+                import html as _html
+                pg.insert_htmlbox(
+                    fitz.Rect(sig_x + 4, sig_y + 2, sig_x + sig_w - 4, sig_y + sig_h - 2),
+                    f'<div dir="auto" style="font-size:18px;color:#0000b3;text-align:center">'
+                    f'{_html.escape(text, quote=False)}</div>',
+                )
 
-            # Date under the box
-            from datetime import datetime
-            date_str = datetime.now().strftime("%d/%m/%Y")
-            pg.insert_text(
-                fitz.Point(sig_x + 6, sig_y + sig_h + 12),
-                date_str,
-                fontsize=8,
-                color=(0.4, 0.4, 0.4),
-            )
+            if add_date:
+                from datetime import datetime
+                pg.insert_text(
+                    fitz.Point(sig_x + 6, sig_y + sig_h + 12),
+                    datetime.now().strftime("%d/%m/%Y"),
+                    fontsize=8,
+                    color=(0.4, 0.4, 0.4),
+                )
 
             out = _temp_pdf("signed")
             doc.save(out, deflate=True)
         return out
 
-    result_path = await asyncio.to_thread(_sign, upload_meta["path"])
+    try:
+        result_path = await asyncio.to_thread(_sign, upload_meta["path"])
+    except ValueError:
+        raise HTTPException(400, detail="The signature image could not be read")
     out_name = f"{Path(file.filename or 'signed').stem}_signed.pdf"
     output_meta = await StorageService.save_output(result_path, out_name)
     return make_file_response(
