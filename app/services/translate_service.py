@@ -17,6 +17,7 @@ import httpx
 from deep_translator import GoogleTranslator
 
 from ..config import settings
+from . import progress
 from ..services.pdf_service import _temp_pdf, _ms
 from ..utils.errors import ApiError
 
@@ -164,11 +165,15 @@ class TranslateService:
         with fitz.open(pdf_path) as doc:
             target = [p - 1 for p in pages] if pages else range(doc.page_count)
 
-            for i in target:
+            target = list(target)
+            for k, i in enumerate(target):
+                progress.update(k, len(target), "translating")
                 if not (0 <= i < doc.page_count):
                     continue
                 page = doc[i]
                 units = _text_units(page, erase_icons=is_rtl)
+                translator.on_progress = (
+                    lambda f, k=k, n=len(target): progress.update(k + 0.9 * f, n, "translating"))
                 stats["tried"] += len(units)
                 translations = translator.translate_many([u["text"] for u in units]) if units else []
                 placed = []
@@ -217,7 +222,9 @@ class TranslateService:
             target = [p - 1 for p in pages] if pages else range(doc.page_count)
             new_doc = fitz.open()
 
-            for i in target:
+            target = list(target)
+            for k, i in enumerate(target):
+                progress.update(k, len(target), "translating")
                 if not (0 <= i < doc.page_count):
                     continue
                 page = doc[i]
@@ -302,7 +309,8 @@ class _Translator:
         self.last_error: str | None = None
         self._client = httpx.Client(timeout=20, headers={"User-Agent": "Mozilla/5.0"})
         self._fallback = None
-        self._latin_lang: str | None = None  # document's Latin-script language, detected once
+        self._latin_lang: str | None = None
+        self.on_progress = None  # called with the fraction (0-1) of the current batch done  # document's Latin-script language, detected once
         # circuit breaker: after 3 failures in a row a route is skipped for this
         # document, so a blocked service fails fast instead of retrying every block
         self._fails: dict[str, int] = {}
@@ -377,8 +385,13 @@ class _Translator:
                 raise RuntimeError(f"cloudflare HTTP {r.status_code}: {r.text[:200]}")
             return r.json()["result"]["translated_text"]
 
+        results = []
         with ThreadPoolExecutor(max_workers=16) as pool:
-            return list(pool.map(one, texts))
+            for r in pool.map(one, texts):
+                results.append(r)
+                if self.on_progress:
+                    self.on_progress(len(results) / len(texts))
+        return results
 
     def _try_many(self, texts: list[str]) -> list[str] | None:
         """Batch through the official APIs; None if none is configured or all failed."""

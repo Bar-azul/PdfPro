@@ -55,6 +55,31 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ── Progress (?job_id= on tool requests, polled by the site) ───────────────────
+from .services import progress as _progress
+
+
+@app.middleware("http")
+async def progress_middleware(request, call_next):
+    token = _progress.begin(request.query_params.get("job_id")) if request.method == "POST" else None
+    ok = False
+    try:
+        response = await call_next(request)
+        ok = response.status_code < 400
+        return response
+    finally:
+        if token is not None:
+            _progress.end(token, ok)
+
+
+@app.get("/api/progress/{job_id}", tags=["Health"], include_in_schema=False)
+async def get_progress(job_id: str):
+    info = _progress.get(job_id)
+    if info is None:
+        return JSONResponse(status_code=404, content={"detail": "unknown job", "code": "unknown_job"})
+    return info
+
+
 # ── Rate limiter ───────────────────────────────────────────────────────────────
 setup_rate_limiter(app)
 

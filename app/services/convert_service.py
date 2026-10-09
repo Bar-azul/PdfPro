@@ -17,6 +17,7 @@ import fitz
 from PIL import Image
 
 from ..config import settings
+from . import progress
 from ..services.pdf_service import PDFService, _temp_pdf, _temp_file, _ms
 
 logger = logging.getLogger(__name__)
@@ -129,6 +130,30 @@ def _image_for_pdf(img_path: Path):
         return buf.getvalue(), upright.width, upright.height, 0
 
 
+class _Pdf2DocxProgress(logging.Handler):
+    """
+    pdf2docx logs "(i/n) Page p" while it parses pages ([3/4]) and again while it
+    writes them ([4/4]); turn those lines into real progress: parsing is the first
+    half of the bar, writing the second.
+    """
+
+    def __init__(self):
+        super().__init__(level=logging.INFO)
+        self.phase = 0
+
+    def emit(self, record):
+        if "pdf2docx" not in record.pathname:
+            return
+        msg = str(record.msg)
+        if "[3/4]" in msg:
+            self.phase = 0
+        elif "[4/4]" in msg:
+            self.phase = 1
+        elif msg.startswith("(%d/%d)") and len(record.args or ()) >= 2:
+            i, n = record.args[0], record.args[1]
+            progress.update(self.phase * n + i, 2 * n, "pages")
+
+
 class ConvertService:
 
     @staticmethod
@@ -138,9 +163,17 @@ class ConvertService:
         pdf_path = Path(pdf_path).resolve()
         out = _temp_file("converted", ".docx")
         cv = Converter(str(pdf_path))
+        handler = _Pdf2DocxProgress()
+        root = logging.getLogger()
+        root.addHandler(handler)
+        old_level = root.level
+        if root.level > logging.INFO or root.level == logging.NOTSET:
+            root.setLevel(logging.INFO)
         try:
             cv.convert(str(out), start=0, end=None)
         finally:
+            root.removeHandler(handler)
+            root.setLevel(old_level)
             cv.close()
             gc.collect()
         logger.info(f"PDF→Word in {_ms(t0)}ms")
@@ -171,6 +204,7 @@ class ConvertService:
 
         with fitz.open(pdf_path) as doc:
             for page_num, page in enumerate(doc, start=1):
+                progress.update(page_num - 1, doc.page_count, "pages")
                 page_text = page.get_text().strip()
                 any_text = any_text or bool(page_text)
                 try:
@@ -237,6 +271,7 @@ class ConvertService:
             prs.slide_height = int(first_page.height / 72 * 914400)
 
         blank_layout = prs.slide_layouts[6]
+        progress.stage("saving")
         try:
             for img_path in image_paths:
                 slide = prs.slides.add_slide(blank_layout)
@@ -312,6 +347,7 @@ class ConvertService:
             env = os.environ.copy()
             env["HOME"] = str(work_dir)
 
+            progress.stage("converting")
             result = subprocess.run(
                 cmd, capture_output=True, text=True,
                 timeout=120, cwd=str(work_dir), env=env,
@@ -348,7 +384,8 @@ class ConvertService:
         sizes = {"A4":(595,842),"Letter":(612,792),"Legal":(612,1008),"A3":(842,1190)}
 
         try:
-            for img_path in image_paths:
+            for k, img_path in enumerate(image_paths, 1):
+                progress.update(k - 1, len(image_paths), "images")
                 stream, w_px, h_px, rotate = _image_for_pdf(img_path)
                 w_pt = w_px * 72 / 96
                 h_pt = h_px * 72 / 96

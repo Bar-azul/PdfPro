@@ -16,6 +16,8 @@ from pathlib import Path
 from typing import Literal
 
 import fitz  # PyMuPDF
+
+from . import progress
 from PIL import Image
 
 from ..config import settings
@@ -45,10 +47,12 @@ class PDFService:
         t0 = time.time()
         result = fitz.open()
 
-        for path in pdf_paths:
+        for k, path in enumerate(pdf_paths, 1):
             with fitz.open(path) as src:
                 result.insert_pdf(src)
+            progress.update(k, len(pdf_paths), "files")
 
+        progress.stage("saving")
         out = _temp_pdf("merged")
         result.save(out, deflate=True, garbage=2)
         result.close()
@@ -77,6 +81,7 @@ class PDFService:
                 part.save(out, deflate=True)
                 part.close()
                 outputs.append(out)
+                progress.update(i + 1, len(ranges), "parts")
 
         logger.info(f"Split into {len(outputs)} parts in {_ms(t0)}ms")
         return outputs
@@ -120,6 +125,7 @@ class PDFService:
                 outputs.append(out)
                 chunk_start += n
                 i += 1
+                progress.update(i, -(-total // n), "parts")
 
         logger.info(f"Split every {n} pages → {len(outputs)} parts in {_ms(t0)}ms")
         return outputs
@@ -130,9 +136,10 @@ class PDFService:
         t0 = time.time()
         with fitz.open(pdf_path) as src:
             result = fitz.open()
-            for p in pages:
+            for k, p in enumerate(pages, 1):
                 if 1 <= p <= src.page_count:
                     result.insert_pdf(src, from_page=p - 1, to_page=p - 1)
+                progress.update(k, len(pages), "pages")
             out = _temp_pdf("extracted")
             result.save(out, deflate=True)
             result.close()
@@ -159,17 +166,21 @@ class PDFService:
             page_count = doc.page_count
             widths = _image_display_widths(doc)
             seen: set[int] = set()
+            n_images = len({item[0] for page in doc for item in page.get_images(full=True)})
+            progress.update(0, n_images, "images")
             for page in doc:
                 for item in page.get_images(full=True):
                     xref = item[0]
                     if xref in seen:            # shared images (a logo on every page) once only
                         continue
                     seen.add(xref)
+                    progress.update(len(seen) - 1, n_images, "images")
                     try:
                         _recompress_image(doc, xref, widths.get(xref), threshold, target, quality)
                     except Exception as exc:    # leave that image exactly as it was
                         logger.warning(f"compress: skipped image xref {xref}: {exc}")
                     fitz.TOOLS.store_shrink(100)  # drop MuPDF's decoded-image cache, keeps memory flat
+            progress.stage("saving")
             doc.save(out, garbage=3, deflate=True, use_objstms=1)
 
         with fitz.open(out) as check:
@@ -197,6 +208,7 @@ class PDFService:
                 if 0 <= i < doc.page_count:
                     # relative to the current rotation (scans often already carry /Rotate)
                     doc[i].set_rotation((doc[i].rotation + angle) % 360)
+            progress.stage("saving")
             out = _temp_pdf("rotated")
             doc.save(out, deflate=True)
         logger.info(f"Rotated {angle}° in {_ms(t0)}ms")
@@ -241,7 +253,8 @@ class PDFService:
 
         with fitz.open(pdf_path) as doc:
             target = [p - 1 for p in pages] if pages else range(doc.page_count)
-            for i in target:
+            for k, i in enumerate(target, 1):
+                progress.update(k - 1, len(target), "pages")
                 if 0 <= i < doc.page_count:
                     page = doc[i]
                     r = page.rect
@@ -249,6 +262,7 @@ class PDFService:
                                     r.x1 - r.width * 0.08, r.y1 - r.height * 0.08)
                     # show_pdf_page rotates counter-clockwise; the API's rotation is clockwise-negative
                     page.show_pdf_page(box, stamp, 0, clip=clip, rotate=-rotation, overlay=True)
+            progress.stage("saving")
             out = _temp_pdf("watermarked")
             doc.save(out, deflate=True)
         stamp.close()
@@ -266,7 +280,8 @@ class PDFService:
         t0 = time.time()
         with fitz.open(pdf_path) as doc:
             target = [p - 1 for p in pages] if pages else range(doc.page_count)
-            for i in target:
+            for k, i in enumerate(target, 1):
+                progress.update(k - 1, len(target), "pages")
                 if 0 <= i < doc.page_count:
                     page = doc[i]
                     rect = page.rect
@@ -310,6 +325,7 @@ class PDFService:
             perm |= fitz.PDF_PERM_MODIFY | fitz.PDF_PERM_ANNOTATE
 
         with fitz.open(pdf_path) as doc:
+            progress.stage("saving")
             out = _temp_pdf("protected")
             doc.save(
                 out,
@@ -331,6 +347,7 @@ class PDFService:
                 success = doc.authenticate(password)
                 if not success:
                     raise ValueError("Incorrect password")
+            progress.stage("saving")
             out = _temp_pdf("unlocked")
             doc.save(out, encryption=fitz.PDF_ENCRYPT_NONE, deflate=True)
         logger.info(f"PDF unlocked in {_ms(t0)}ms")
@@ -352,7 +369,8 @@ class PDFService:
 
         with fitz.open(pdf_path) as doc:
             target = [p - 1 for p in pages] if pages else range(doc.page_count)
-            for i in target:
+            for k, i in enumerate(target, 1):
+                progress.update(k - 1, len(target), "pages")
                 if 0 <= i < doc.page_count:
                     page = doc[i]
                     for text in texts:
@@ -371,6 +389,7 @@ class PDFService:
                             total_redactions += 1
                     page.apply_redactions()
 
+            progress.stage("saving")
             out = _temp_pdf("redacted")
             doc.save(out, deflate=True)
 
@@ -421,7 +440,8 @@ class PDFService:
 
         with fitz.open(pdf_path) as doc:
             target = [p - 1 for p in pages] if pages else range(doc.page_count)
-            for i in target:
+            for k, i in enumerate(target, 1):
+                progress.update(k - 1, len(target), "pages")
                 if 0 <= i < doc.page_count:
                     pix = doc[i].get_pixmap(matrix=matrix, alpha=False)
                     out = _temp_file(f"page{i+1}", f".{fmt}")

@@ -18,6 +18,7 @@ import pytesseract
 from PIL import Image, ImageEnhance
 
 from ..config import settings
+from . import progress
 from ..services.pdf_service import _temp_pdf, _temp_file, _ms
 
 logger = logging.getLogger(__name__)
@@ -417,7 +418,8 @@ class OCRService:
         results = []
         with fitz.open(pdf_path) as doc:
             target = [p - 1 for p in pages] if pages else range(doc.page_count)
-            for i in target:
+            for k, i in enumerate(target):
+                progress.update(k, len(target), "ocr")
                 if not (0 <= i < doc.page_count):
                     continue
                 page = doc[i]
@@ -481,6 +483,7 @@ class OCRService:
         try:
             with fitz.open(pdf_path) as doc:
                 for page in doc:
+                    progress.update(page.number, doc.page_count, "ocr")
                     visible, invisible = _invisible_text_spans(page)
                     # pages that already have real text are searchable as they are
                     if visible > 50:
@@ -508,6 +511,7 @@ class OCRService:
                         )
                     fitz.TOOLS.store_shrink(100)
                     gc.collect()
+                progress.stage("saving")
                 out = _temp_pdf("searchable")
                 doc.save(out, deflate=True, garbage=3)
         finally:
@@ -580,6 +584,7 @@ class OCRService:
         Auto-detects rotation and enhances image quality before OCR.
         """
         t0 = time.time()
+        progress.update(0, 1, "ocr")
 
         from PIL import ImageOps
         with Image.open(image_path) as raw:
