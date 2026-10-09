@@ -401,7 +401,9 @@ class _Translator:
             nonlocal batch, size
             if not batch:
                 return
-            official = self._try_many([texts[i] for i in batch])
+            # a block's line breaks are just where the PDF wrapped it: send it as one
+            # sentence (as the gtx path does) so it translates and re-wraps cleanly
+            official = self._try_many([" ".join(texts[i].split()) for i in batch])
             if official:
                 for i, part in zip(batch, official):
                     results[i] = part.strip()
