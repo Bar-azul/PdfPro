@@ -8,6 +8,11 @@ import re
 import time
 from pathlib import Path
 
+import os
+
+# Tesseract's OpenMP threads only fight each other on the server's fraction of a CPU
+os.environ.setdefault("OMP_THREAD_LIMIT", "1")
+
 import fitz
 import pytesseract
 from PIL import Image, ImageEnhance
@@ -38,6 +43,157 @@ def _image_to_pdf(image_path: Path) -> Path:
     return out
 
 
+# Render budget per page. A4 at 300 dpi is ~8.7 MP; phone-scan PDFs often have pages
+# sized in pixels-as-points (4000x3000 pt), which at 300 dpi would be 100+ MP and
+# blow past the server's 512 MB. Grey 8-bit keeps one page at ~10 MB.
+_MAX_RENDER_PIXELS = 10_000_000
+_MAX_RENDER_SIDE = 4000
+
+
+def _render_page_gray(page: "fitz.Page", dpi: int) -> Image.Image:
+    """Render a page as it looks (rotation applied) in 8-bit grey, capped in size."""
+    w_in, h_in = page.rect.width / 72, page.rect.height / 72
+    scale = dpi
+    if w_in * h_in * scale * scale > _MAX_RENDER_PIXELS:
+        scale = (_MAX_RENDER_PIXELS / (w_in * h_in)) ** 0.5
+    scale = min(scale, _MAX_RENDER_SIDE / max(w_in, h_in))
+    pix = page.get_pixmap(matrix=fitz.Matrix(scale / 72, scale / 72),
+                          colorspace=fitz.csGRAY, alpha=False)
+    img = Image.frombytes("L", (pix.width, pix.height), pix.samples)
+    del pix
+    # MuPDF keeps decoded page images in its cache; on scans that is a full page
+    # of pixels per page, which piled up to 500+ MB on an 8-page scan.
+    fitz.TOOLS.store_shrink(100)
+    return img
+
+
+def _invisible_text_spans(page: "fitz.Page") -> tuple[int, list]:
+    """
+    (visible character count, bboxes of invisible text spans).
+    Scanner apps (Adobe Scan, Microsoft Lens, some phone galleries) add their own
+    invisible OCR layer, which is often garbage for Hebrew. Text that is drawn
+    (render mode != 3) is real text and is kept.
+    """
+    visible, invisible = 0, []
+    try:
+        for span in page.get_texttrace():
+            n = len(span.get("chars", ()))
+            if span.get("type") == 3 or span.get("opacity", 1) == 0:
+                invisible.append(fitz.Rect(span["bbox"]))
+            else:
+                visible += n
+    except Exception:
+        visible = len(page.get_text().strip())
+    return visible, invisible
+
+
+def _needs_ocr(page: "fitz.Page") -> bool:
+    visible, _ = _invisible_text_spans(page)
+    return visible <= 50
+
+
+def _data_to_text(data: dict) -> str:
+    """Tesseract word boxes → text with the original line and paragraph breaks."""
+    out, last_par, line_words, last_line = [], None, [], None
+    for i, word in enumerate(data["text"]):
+        word = word.strip()
+        if not word or float(data["conf"][i]) < 0:
+            continue
+        par = (data["block_num"][i], data["par_num"][i])
+        line = par + (data["line_num"][i],)
+        if line != last_line and line_words:
+            out.append(" ".join(line_words)); line_words = []
+        if last_par is not None and par != last_par:
+            out.append("")
+        line_words.append(word)
+        last_line, last_par = line, par
+    if line_words:
+        out.append(" ".join(line_words))
+    return "\n".join(out).strip()
+
+
+def _confidence(data: dict) -> float:
+    confs = [float(c) for w, c in zip(data["text"], data["conf"]) if w.strip() and float(c) >= 0]
+    return round(sum(confs) / len(confs) / 100, 3) if confs else 0.0
+
+
+_RTL_LANGS = {"heb", "ara", "fas", "yid"}
+_HEB_ARA = re.compile(r"[\u0590-\u06FF]")
+_LATIN = re.compile(r"[A-Za-z]")
+_BIDI_MARKS = dict.fromkeys(map(ord, "\u200e\u200f\u202a\u202b\u202c\u202d\u202e"))
+
+
+def _box(d: dict, i: int) -> tuple:
+    return (d["left"][i], d["top"][i], d["left"][i] + d["width"][i], d["top"][i] + d["height"][i])
+
+
+def _overlap(a: tuple, b: tuple) -> float:
+    """Share of box a covered by box b."""
+    w = max(0, min(a[2], b[2]) - max(a[0], b[0]))
+    h = max(0, min(a[3], b[3]) - max(a[1], b[1]))
+    return w * h / max(1, (a[2] - a[0]) * (a[3] - a[1]))
+
+
+def _fix_latin_misreads(mixed: dict, rtl_only: dict) -> int:
+    """
+    With heb+eng, Tesseract regularly reads a Hebrew word as Latin junk
+    ("ביום" → "ova", "עם" → "OY"). For Latin-only words inside mostly-Hebrew
+    lines, take the Hebrew-only reading of the same spot when it is more
+    confident. Real English words (emails, URLs, names read confidently) stay.
+    Edits `mixed` in place; returns how many words were replaced.
+    """
+    lines: dict[tuple, list[int]] = {}
+    for i, w in enumerate(mixed["text"]):
+        if w.strip() and float(mixed["conf"][i]) >= 0:
+            lines.setdefault((mixed["block_num"][i], mixed["par_num"][i], mixed["line_num"][i]), []).append(i)
+    rtl_words = [j for j, w in enumerate(rtl_only["text"]) if w.strip() and float(rtl_only["conf"][j]) >= 0]
+    replaced = 0
+    for idx in lines.values():
+        rtl_count = sum(bool(_HEB_ARA.search(mixed["text"][i])) for i in idx)
+        if rtl_count * 2 < len(idx):
+            continue  # an English line: leave it to the English model
+        for i in idx:
+            word, conf = mixed["text"][i], float(mixed["conf"][i])
+            if not _LATIN.search(word) or _HEB_ARA.search(word) or conf >= 90:
+                continue
+            if "@" in word or "www" in word.lower() or "://" in word:
+                continue
+            b = _box(mixed, i)
+            cand = [j for j in rtl_words
+                    if _overlap(b, _box(rtl_only, j)) > 0.5 or _overlap(_box(rtl_only, j), b) > 0.5]
+            if not cand:
+                continue
+            cand_conf = sum(float(rtl_only["conf"][j]) for j in cand) / len(cand)
+            text = " ".join(rtl_only["text"][j].strip() for j in cand)
+            if cand_conf > conf and _HEB_ARA.search(text):
+                mixed["text"][i] = text
+                mixed["conf"][i] = cand_conf
+                replaced += 1
+    return replaced
+
+
+def _ocr_pil(img: Image.Image, language: str):
+    """Prepare (rotate/enhance) and OCR one image → (prepared image, osd angle, data)."""
+    img, angle = _prepare_image(img, with_angle=True)
+    data = pytesseract.image_to_data(
+        img, lang=language, config="--oem 3 --psm 3",
+        output_type=pytesseract.Output.DICT,
+    )
+    langs = language.split("+")
+    rtl = [l for l in langs if l in _RTL_LANGS]
+    if rtl and len(rtl) < len(langs):
+        rtl_data = pytesseract.image_to_data(
+            img, lang="+".join(rtl), config="--oem 3 --psm 3",
+            output_type=pytesseract.Output.DICT,
+        )
+        n = _fix_latin_misreads(data, rtl_data)
+        if n:
+            logger.info(f"OCR: {n} Latin misreads replaced from the {'+'.join(rtl)} pass")
+    # Tesseract sprinkles LRM/RLM marks into RTL output; they break search and copy
+    data["text"] = [w.translate(_BIDI_MARKS) for w in data["text"]]
+    return img, angle, data
+
+
 def _prepare_image(img: Image.Image, with_angle: bool = False):
     """
     Prepare image for best OCR accuracy:
@@ -62,12 +218,20 @@ def _prepare_image(img: Image.Image, with_angle: bool = False):
     # Step 3 — Auto-detect and fix rotation
     angle = 0
     try:
+        # orientation needs far less detail than reading: a ~1500 px copy is enough
+        probe = img
+        if max(img.size) > 1500:
+            r = 1500 / max(img.size)
+            probe = img.resize((int(img.width * r), int(img.height * r)), Image.BILINEAR)
         osd = pytesseract.image_to_osd(
-            img,
+            probe,
             output_type=pytesseract.Output.DICT,
             config="--psm 0",
         )
         angle = osd.get("rotate", 0)
+        # a guess on a page with little text can be wrong; only turn the page when sure
+        if float(osd.get("orientation_conf", 0)) < 2:
+            angle = 0
         if angle and angle != 0:
             img = img.rotate(-angle, expand=True)
             logger.info(f"Auto-rotated image by {angle}°")
@@ -172,8 +336,6 @@ class OCRService:
 
         # ── PDF: page by page ─────────────────────────────────────────────────
         results = []
-        matrix = fitz.Matrix(dpi / 72, dpi / 72)
-
         with fitz.open(pdf_path) as doc:
             target = [p - 1 for p in pages] if pages else range(doc.page_count)
             for i in target:
@@ -181,43 +343,24 @@ class OCRService:
                     continue
                 page = doc[i]
 
-                # Use native text if available
-                native_text = page.get_text().strip()
-                if native_text and len(native_text) > 50:
+                # Real (visible) text: use it as is. Invisible text from a scanner
+                # app's own OCR is ignored and the page is read again.
+                if not _needs_ocr(page):
                     results.append({
                         "page": i + 1,
-                        "text": native_text,
+                        "text": page.get_text().strip(),
                         "confidence": 1.0,
                         "source": "native",
                     })
                     continue
 
-                # Render → prepare → OCR
-                pix = page.get_pixmap(matrix=matrix, alpha=False)
-                img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-                del pix
-
-                img = _prepare_image(img)
-
-                data = pytesseract.image_to_data(
-                    img,
-                    lang=language,
-                    config="--oem 3 --psm 3",
-                    output_type=pytesseract.Output.DICT,
-                )
+                img = _render_page_gray(page, dpi)
+                img, _angle, data = _ocr_pil(img, language)
                 del img
-
-                words = [
-                    w for w, c in zip(data["text"], data["conf"])
-                    if w.strip() and int(c) > 20
-                ]
-                valid_confs = [int(c) for c in data["conf"] if int(c) > 0]
-                avg_conf = (sum(valid_confs) / len(valid_confs) / 100) if valid_confs else 0.0
-
                 results.append({
                     "page": i + 1,
-                    "text": " ".join(words),
-                    "confidence": round(avg_conf, 3),
+                    "text": _data_to_text(data),
+                    "confidence": _confidence(data),
                     "source": "ocr",
                 })
                 gc.collect()
@@ -256,20 +399,14 @@ class OCRService:
             converted = pdf_path = _image_to_pdf(pdf_path)
 
         try:
-            matrix = fitz.Matrix(dpi / 72, dpi / 72)
             with fitz.open(pdf_path) as doc:
                 for page in doc:
+                    visible, invisible = _invisible_text_spans(page)
                     # pages that already have real text are searchable as they are
-                    if len(page.get_text().strip()) > 50:
+                    if visible > 50:
                         continue
-                    pix = page.get_pixmap(matrix=matrix, alpha=False)  # as it looks (rotation applied)
-                    img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-                    del pix
-                    img, osd_angle = _prepare_image(img, with_angle=True)
-                    data = pytesseract.image_to_data(
-                        img, lang=language, config="--oem 3 --psm 3",
-                        output_type=pytesseract.Output.DICT,
-                    )
+                    img = _render_page_gray(page, dpi)  # as it looks (rotation applied)
+                    img, osd_angle, data = _ocr_pil(img, language)
                     vis_w, vis_h = page.rect.width, page.rect.height
                     if osd_angle % 180:
                         vis_w, vis_h = vis_h, vis_w
@@ -277,12 +414,19 @@ class OCRService:
                     del img
                     if layer is None:
                         continue
+                    if invisible:
+                        # drop the scanner app's own (usually wrong for Hebrew) OCR layer
+                        for r in invisible:
+                            page.add_redact_annot(r)
+                        page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE,
+                                              graphics=fitz.PDF_REDACT_LINE_ART_NONE)
                     with layer:
                         target = (page.rect * page.derotation_matrix).normalize()
                         page.show_pdf_page(
                             target, layer, 0, overlay=True,
                             rotate=(page.rotation + osd_angle) % 360,
                         )
+                    fitz.TOOLS.store_shrink(100)
                     gc.collect()
                 out = _temp_pdf("searchable")
                 doc.save(out, deflate=True, garbage=3)
@@ -302,19 +446,45 @@ class OCRService:
         from docx.shared import Pt
         from docx.enum.text import WD_ALIGN_PARAGRAPH
 
+        from docx.oxml.ns import qn
+        from docx.oxml import OxmlElement
+
         results = OCRService.extract_text(pdf_path, language=language, dpi=dpi)
         doc = Document()
-        title = doc.add_heading("מסמך מחולץ — OCR", level=1)
-        title.alignment = WD_ALIGN_PARAGRAPH.RIGHT
 
-        for r in results:
-            doc.add_heading(f"עמוד {r['page']}", level=2)
-            para = doc.add_paragraph(r["text"])
-            para.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-            for run in para.runs:
-                run.font.name = "David"
-                run.font.size = Pt(12)
-            doc.add_paragraph()
+        def add_par(text: str, size: int = 12, bold: bool = False):
+            rtl = bool(_RTL_CHARS.search(text))
+            para = doc.add_paragraph()
+            if rtl:
+                # paragraph direction RTL, so periods/brackets land on the correct side in Word
+                ppr = para._p.get_or_add_pPr()
+                ppr.append(OxmlElement("w:bidi"))
+                para.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+            for line in [text]:
+                run = para.add_run(line)
+                run.font.size = Pt(size)
+                run.bold = bold
+                run.font.name = "David" if rtl else "Calibri"
+                rpr = run._r.get_or_add_rPr()
+                fonts = rpr.find(qn("w:rFonts"))
+                if fonts is None:
+                    fonts = OxmlElement("w:rFonts"); rpr.append(fonts)
+                fonts.set(qn("w:cs"), "David")  # Hebrew/Arabic use the complex-script font
+                if rtl:
+                    rpr.append(OxmlElement("w:rtl"))
+            return para
+
+        for n, r in enumerate(results):
+            if len(results) > 1:
+                add_par(f"— {r['page']} —", size=10, bold=True)
+            for block in [b for b in r["text"].split("\n\n") if b.strip()]:
+                lines = block.split("\n")
+                for k, line in enumerate(lines):
+                    para = add_par(line)
+                    para.paragraph_format.space_after = Pt(8 if k == len(lines) - 1 else 0)
+            if n < len(results) - 1:
+                from docx.enum.text import WD_BREAK
+                doc.paragraphs[-1].add_run().add_break(WD_BREAK.PAGE)
 
         out = _temp_file("ocr_output", ".docx")
         doc.save(str(out))
@@ -331,22 +501,12 @@ class OCRService:
 
         from PIL import ImageOps
         with Image.open(image_path) as raw:
-            img = _prepare_image(ImageOps.exif_transpose(raw))
-            data = pytesseract.image_to_data(
-                img,
-                lang=language,
-                config="--oem 3 --psm 3",
-                output_type=pytesseract.Output.DICT,
-            )
-
-        words = [
-            w for w, c in zip(data["text"], data["conf"])
-            if w.strip() and int(c) > 20
-        ]
-        text = " ".join(words)
-        valid_confs = [int(c) for c in data["conf"] if int(c) > 0]
-        avg_conf = (sum(valid_confs) / len(valid_confs) / 100) if valid_confs else 0.0
-
+            raw.draft("L", (_MAX_RENDER_SIDE, _MAX_RENDER_SIDE))  # JPEG: decode smaller, cheaper
+            img = ImageOps.exif_transpose(raw).convert("L")
+        img, _angle, data = _ocr_pil(img, language)
+        del img
+        text = _data_to_text(data)
+        avg_conf = _confidence(data)
         gc.collect()
         logger.info(f"Image OCR in {_ms(t0)}ms, conf={avg_conf:.2f}")
         return {"text": text, "confidence": round(avg_conf, 3)}
