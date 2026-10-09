@@ -339,7 +339,13 @@ class PDFService:
                     for text in texts:
                         rects = page.search_for(text, quads=False)
                         if case_sensitive:
-                            rects = [r for r in rects if text in page.get_textbox(r + (-1, -1, 1, 1))]
+                            # Drop only hits that are clearly a different-case match on one line.
+                            # Fragments of a match split across lines don't contain the whole text,
+                            # so they are kept: when in doubt, redact rather than leak.
+                            def _wrong_case(r):
+                                box = page.get_textbox(r + (-1, -1, 1, 1))
+                                return text.lower() in box.lower() and text not in box
+                            rects = [r for r in rects if not _wrong_case(r)]
                         for rect in rects:
                             page.add_redact_annot(rect, fill=(0, 0, 0))
                             total_redactions += 1
@@ -444,38 +450,75 @@ def _finish(img, scale):
     return img
 
 
+def _image_colorspace(doc, xref):
+    """('DeviceRGB'|'DeviceGray'|'ICCBased', components, icc_profile_bytes) or None for anything else
+    (CMYK, Lab, Separation, Indexed...), which must go through MuPDF's colour conversion."""
+    kind, value = doc.xref_get_key(xref, "ColorSpace")
+    if kind == "name" and value in ("/DeviceRGB", "/DeviceGray"):
+        return value[1:], (3 if value == "/DeviceRGB" else 1), None
+    text = value
+    if kind == "xref":
+        text = doc.xref_object(int(value.split()[0]), compressed=True)
+    m = re.search(r"/ICCBased\s*(\d+)\s+0\s+R", text or "")
+    if not m:
+        return None
+    icc = int(m.group(1))
+    n = doc.xref_get_key(icc, "N")[1]
+    if n not in ("1", "3"):
+        return None
+    return "ICCBased", int(n), doc.xref_stream(icc)
+
+
 def _decode_jpeg_scaled(doc, xref, shown_width_pt, threshold, target):
     """Plain RGB/gray JPEGs (most scans and photos): let libjpeg decode straight to a smaller
-    size (draft mode), so a 600 dpi page never has to sit in memory at full resolution."""
+    size (draft mode), so a 600 dpi page never has to sit in memory at full resolution.
+    Only for DeviceRGB/DeviceGray/ICC RGB-or-gray; ICC RGB is converted to sRGB afterwards."""
     if doc.xref_get_key(xref, "Filter")[1] != "/DCTDecode" or doc.xref_get_key(xref, "Decode")[0] != "null":
         return None
+    cs = _image_colorspace(doc, xref)
+    if cs is None:
+        return None
+    name, n, icc = cs
     img = Image.open(io.BytesIO(doc.xref_stream_raw(xref)))
-    if img.mode not in ("RGB", "L"):
-        return None                          # CMYK/YCCK JPEGs go through MuPDF
+    if img.mode != ("RGB" if n == 3 else "L"):
+        return None                          # CMYK/YCCK or mismatched JPEGs go through MuPDF
     scale = _scale_for(img.width, shown_width_pt, threshold, target)
     w, h = img.size
     if scale < 0.98:
         img.draft(img.mode, (int(w * scale) + 1, int(h * scale) + 1))
     img.load()
-    return _finish(img, scale * w / img.width)
+    img = _finish(img, scale * w / img.width)
+    if name == "ICCBased" and n == 3 and icc:
+        from PIL import ImageCms
+        img = ImageCms.profileToProfile(
+            img, ImageCms.ImageCmsProfile(io.BytesIO(icc)), ImageCms.createProfile("sRGB"), outputMode="RGB")
+    return img
 
 
 def _decode_with_mupdf(doc, xref, shown_width_pt, threshold, target):
     pix = fitz.Pixmap(doc, xref)            # Flate/JPX/CMYK/ICC/Decode arrays, decoded by MuPDF
-    if pix.alpha:
+    if pix.alpha or pix.colorspace is None:
         return None
-    if pix.colorspace is None or pix.colorspace.n not in (1, 3):
-        pix = fitz.Pixmap(fitz.csRGB, pix)   # CMYK, Lab, etc. -> RGB
     scale = _scale_for(pix.width, shown_width_pt, threshold, target)
     if scale < 0.5:                          # cheap power-of-two shrink first, keeps memory low
         n = int(math.floor(math.log2(1 / scale)))
         pix.shrink(n)
         scale *= 2 ** n
+    # Convert by colour-space *name*: Lab is 3 components and Separation is 1, but neither is RGB/gray.
+    name = pix.colorspace.name
+    if name not in ("DeviceRGB", "DeviceGray"):
+        gray = pix.n == 1 and (name.startswith("ICCBased(Gray") or "Gray" in name)
+        pix = fitz.Pixmap(fitz.csGRAY if gray else fitz.csRGB, pix)
     mode = "L" if pix.n == 1 else "RGB"
-    # frombuffer shares the pixmap's memory instead of copying it
-    img = Image.frombuffer(mode, (pix.width, pix.height), pix.samples_mv, "raw", mode, pix.stride, 1)
-    img = _finish(img, scale)
-    return img.copy() if img.size == (pix.width, pix.height) else img
+    # frombuffer shares the pixmap's memory instead of copying it; release that view
+    # before the pixmap goes away (otherwise PyMuPDF can't free its buffer).
+    view = Image.frombuffer(mode, (pix.width, pix.height), pix.samples_mv, "raw", mode, pix.stride, 1)
+    img = _finish(view, scale)
+    if img is view:
+        img = view.copy()
+    del view
+    del pix
+    return img
 
 
 def _recompress_image(doc, xref, shown_width_pt, threshold, target, quality):
