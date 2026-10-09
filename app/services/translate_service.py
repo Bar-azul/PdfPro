@@ -8,10 +8,12 @@ Supports 40+ languages including Hebrew, Arabic, and RTL languages.
 import html
 import io
 import logging
+import re
 import time
 from pathlib import Path
 
 import fitz
+import httpx
 from deep_translator import GoogleTranslator
 
 from ..services.pdf_service import _temp_pdf, _ms
@@ -19,7 +21,6 @@ from ..utils.errors import ApiError
 
 logger = logging.getLogger(__name__)
 
-_CHUNK_SIZE = 4500
 RTL_LANGS = {"iw", "he", "ar", "fa", "ur", "yi"}
 # line direction (from get_text "dict") → insert_htmlbox rotate value
 _DIR_TO_ROTATE = {(1, 0): 0, (0, -1): 90, (-1, 0): 180, (0, 1): 270}
@@ -45,18 +46,21 @@ class TranslateService:
         pages: list[int] | None = None,
     ) -> Path:
         t0 = time.time()
-        translator = GoogleTranslator(source=source_language, target=target_language)
+        translator = _Translator(source_language, target_language)
         is_rtl = target_language in RTL_LANGS
         stats = {"tried": 0, "failed": 0}
 
-        if preserve_layout:
-            out = TranslateService._translate_overlay(
-                pdf_path, translator, is_rtl, pages, stats
-            )
-        else:
-            out = TranslateService._translate_clean(
-                pdf_path, translator, is_rtl, pages, stats
-            )
+        try:
+            if preserve_layout:
+                out = TranslateService._translate_overlay(
+                    pdf_path, translator, is_rtl, pages, stats
+                )
+            else:
+                out = TranslateService._translate_clean(
+                    pdf_path, translator, is_rtl, pages, stats
+                )
+        finally:
+            translator.close()
 
         if stats["tried"] == 0:
             out.unlink(missing_ok=True)
@@ -64,6 +68,7 @@ class TranslateService:
                            "This PDF has no selectable text to translate. If it is a scan, run OCR first.")
         if stats["failed"] == stats["tried"]:
             out.unlink(missing_ok=True)
+            logger.error(f"Translation failed for every block; last error: {translator.last_error}")
             raise ApiError(502, "translate_failed",
                            "The translation service is not responding right now. Please try again in a few minutes.")
 
@@ -78,7 +83,7 @@ class TranslateService:
     @staticmethod
     def _translate_overlay(
         pdf_path: Path,
-        translator: GoogleTranslator,
+        translator: "_Translator",
         is_rtl: bool,
         pages: list[int] | None,
         stats: dict,
@@ -91,7 +96,7 @@ class TranslateService:
                 if not (0 <= i < doc.page_count):
                     continue
                 page = doc[i]
-                placed = []
+                found = []
                 for block in page.get_text("dict")["blocks"]:
                     if block.get("type") != 0 or not block.get("lines"):
                         continue
@@ -100,9 +105,12 @@ class TranslateService:
                     ).strip()
                     if len(text) < 2:
                         continue
+                    found.append((block, text))
 
-                    stats["tried"] += 1
-                    translated = _safe_translate(translator, text)
+                stats["tried"] += len(found)
+                translations = translator.translate_many([t for _b, t in found]) if found else []
+                placed = []
+                for (block, text), translated in zip(found, translations):
                     if translated is None:
                         stats["failed"] += 1
                         continue
@@ -141,7 +149,7 @@ class TranslateService:
     @staticmethod
     def _translate_clean(
         pdf_path: Path,
-        translator: GoogleTranslator,
+        translator: "_Translator",
         is_rtl: bool,
         pages: list[int] | None,
         stats: dict,
@@ -155,20 +163,17 @@ class TranslateService:
                 if not (0 <= i < doc.page_count):
                     continue
                 page = doc[i]
-                original_text = page.get_text().strip()
-                if not original_text:
+                paragraphs = [b[4].strip() for b in page.get_text("blocks") if b[6] == 0 and b[4].strip()]
+                if not paragraphs:
                     new_doc.new_page(width=page.rect.width, height=page.rect.height)
                     continue
 
-                stats["tried"] += 1
-                translated = _safe_translate(translator, original_text)
-                if translated is None:
-                    stats["failed"] += 1
-                    translated = original_text
+                stats["tried"] += len(paragraphs)
+                translated = translator.translate_many(paragraphs)
+                stats["failed"] += sum(t is None for t in translated)
+                translated = [t if t is not None else o for t, o in zip(translated, paragraphs)]
 
-                html = "".join(
-                    _html_block(par, 11, is_rtl) for par in translated.split("\n\n") if par.strip()
-                )
+                html = "".join(_html_block(par, 11, is_rtl) for par in translated if par.strip())
                 mediabox = fitz.Rect(0, 0, page.rect.width, page.rect.height)
                 where = mediabox + (50, 50, -50, -50)
                 story = fitz.Story(html=html)
@@ -198,8 +203,11 @@ class TranslateService:
         target_language: str,
         source_language: str = "auto",
     ) -> str:
-        translator = GoogleTranslator(source=source_language, target=target_language)
-        result = _safe_translate(translator, text)
+        translator = _Translator(source_language, target_language)
+        try:
+            result = translator.translate(text)
+        finally:
+            translator.close()
         if result is None:
             raise ApiError(502, "translate_failed",
                            "The translation service is not responding right now. Please try again in a few minutes.")
@@ -214,17 +222,145 @@ class TranslateService:
             return SUPPORTED_LANGUAGES
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Translation backend ───────────────────────────────────────────────────────
 
-def _safe_translate(translator: GoogleTranslator, text: str) -> str | None:
-    text = text.strip()
-    if not text:
-        return text
-    try:
-        if len(text) <= _CHUNK_SIZE:
-            return translator.translate(text)
-        chunks = [text[i:i + _CHUNK_SIZE] for i in range(0, len(text), _CHUNK_SIZE)]
-        return " ".join(translator.translate(chunk) for chunk in chunks)
-    except Exception as e:
-        logger.warning(f"Translation failed: {e}")
-        return None
+_GTX_URL = "https://translate.googleapis.com/translate_a/single"
+_BATCH_CHARS = 1500  # per request; keeps the GET URL well under URL-length limits
+
+
+class _Translator:
+    """
+    Google Translate through the public "gtx" JSON endpoint (the one the browser
+    widget uses), batching many text blocks into one request; deep-translator's
+    page scraper is the fallback. One request per block — the old way — gets an
+    IP throttled after a few dozen blocks.
+    """
+
+    def __init__(self, source: str = "auto", target: str = "en"):
+        self.source = source or "auto"
+        self.target = target
+        self.last_error: str | None = None
+        self._client = httpx.Client(timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+        self._fallback = None
+        # circuit breaker: after 3 failures in a row a route is skipped for this
+        # document, so a blocked service fails fast instead of retrying every block
+        self._fails: dict[str, int] = {}
+
+    def _available(self, name: str) -> bool:
+        return self._fails.get(name, 0) < 3
+
+    def _record(self, name: str, ok: bool):
+        self._fails[name] = 0 if ok else self._fails.get(name, 0) + 1
+
+    def close(self):
+        self._client.close()
+
+    def _gtx(self, text: str) -> str:
+        """One request to the gtx endpoint, with a short retry on throttling/5xx."""
+        params = {"client": "gtx", "sl": self.source, "tl": self.target, "dt": "t", "q": text}
+        for attempt in range(3):
+            r = self._client.get(_GTX_URL, params=params)
+            if r.status_code == 200:
+                data = r.json()
+                return "".join(seg[0] for seg in (data[0] or []) if seg and seg[0])
+            if r.status_code in (429, 500, 502, 503) and attempt < 2:
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            raise RuntimeError(f"gtx HTTP {r.status_code}: {r.text[:200]}")
+        raise RuntimeError("gtx: retries exhausted")
+
+    def _deep(self, text: str) -> str:
+        """deep-translator (scrapes translate.google.com/m) as a second route."""
+        if self._fallback is None:
+            self._fallback = GoogleTranslator(source=self.source, target=self.target)
+        return self._fallback.translate(text)
+
+    def translate(self, text: str) -> str | None:
+        """Translate one text (any length); None if every route failed."""
+        text = text.strip()
+        if not text:
+            return text
+        chunks = _chunks(text, _BATCH_CHARS)
+        out = []
+        for chunk in chunks:
+            done = None
+            for route in (self._gtx, self._deep):
+                name = route.__name__
+                if not self._available(name):
+                    continue
+                try:
+                    done = route(chunk)
+                    self._record(name, bool(done))
+                    if done:
+                        break
+                except Exception as e:  # keep the reason for the log / error message
+                    self._record(name, False)
+                    self.last_error = f"{name}: {e}"
+                    logger.warning(f"Translation failed via {name}: {e}")
+            if not done:
+                return None
+            out.append(done)
+        return " ".join(out)
+
+    def translate_many(self, texts: list[str]) -> list[str | None]:
+        """Translate many short blocks with few requests: one line per block, joined by newlines."""
+        results: list[str | None] = [None] * len(texts)
+        batch: list[int] = []
+        size = 0
+
+        def flush():
+            nonlocal batch, size
+            if not batch:
+                return
+            lines = [" ".join(texts[i].split()) for i in batch]
+            joined = None
+            if self._available("_gtx"):
+                try:
+                    joined = self._gtx("\n".join(lines))
+                    self._record("_gtx", True)
+                except Exception as e:
+                    self._record("_gtx", False)
+                    self.last_error = f"_gtx: {e}"
+                    logger.warning(f"Batch translation failed: {e}")
+            parts = joined.split("\n") if joined else []
+            if len(parts) == len(batch):
+                for i, part in zip(batch, parts):
+                    results[i] = part.strip()
+            else:  # line count changed (or the batch failed): translate one by one
+                for i in batch:
+                    results[i] = self.translate(texts[i])
+            batch, size = [], 0
+
+        for i, t in enumerate(texts):
+            n = len(t)
+            if n > _BATCH_CHARS:
+                flush()
+                results[i] = self.translate(t)
+                continue
+            if size + n > _BATCH_CHARS:
+                flush()
+            batch.append(i)
+            size += n + 1
+        flush()
+        return results
+
+
+def _chunks(text: str, limit: int) -> list[str]:
+    """Split long text at line or sentence ends, never mid-word, into pieces <= limit."""
+    if len(text) <= limit:
+        return [text]
+    pieces, cur = [], ""
+    for part in re.split(r"(?<=[\n.!?։׃])\s+", text):
+        while len(part) > limit:  # one huge sentence: cut at the last space
+            cut = part.rfind(" ", 0, limit)
+            cut = cut if cut > 0 else limit
+            pieces.append(part[:cut]); part = part[cut:].lstrip()
+        if cur and len(cur) + 1 + len(part) > limit:
+            pieces.append(cur); cur = part
+        else:
+            cur = f"{cur} {part}" if cur else part
+    if cur:
+        pieces.append(cur)
+    return pieces
+
+
