@@ -334,12 +334,28 @@ def _get_layer_font() -> fitz.Font:
     return _layer_font
 
 
+def _visual_line(data: dict, idx: list[int]) -> str:
+    """
+    One OCR line as it looks on the page, left to right: words ordered by their
+    position (not by Tesseract's word order), each Hebrew/Arabic word's letters
+    reversed into display order (brackets mirrored). Lines that mix Hebrew with
+    dates, amounts or English then extract correctly, which the old
+    "majority RTL" flag got wrong.
+    """
+    from bidi.algorithm import get_display
+    parts = []
+    for i in sorted(idx, key=lambda k: data["left"][k]):
+        w = data["text"][i].strip()
+        parts.append(get_display(w, base_dir="R") if _RTL_CHARS.search(w) else w)
+    return " ".join(parts)
+
+
 def _text_layer(img_w: int, img_h: int, data: dict, w_pt: float, h_pt: float):
     """
     Build a one-page PDF (w_pt x h_pt, the OCR image's frame) holding the OCR
-    result as invisible text, one string per detected line. Text is written in
-    logical order with right_to_left set for Hebrew/Arabic lines, so copy and
-    search return the words the right way round.
+    result as invisible text, one string per detected line, stored the way Word
+    and browsers store RTL text in PDFs: glyphs in visual (left-to-right) order,
+    which every viewer turns back into reading order with its bidi algorithm.
     """
     font = _get_layer_font()
     sx, sy = w_pt / img_w, h_pt / img_h
@@ -356,21 +372,18 @@ def _text_layer(img_w: int, img_h: int, data: dict, w_pt: float, h_pt: float):
     page = layer.new_page(width=w_pt, height=h_pt)
     tw = fitz.TextWriter(page.rect)
     for idx in lines.values():
-        words = [data["text"][i].strip() for i in idx]
         left = min(data["left"][i] for i in idx)
         right = max(data["left"][i] + data["width"][i] for i in idx)
         top = min(data["top"][i] for i in idx)
         bottom = max(data["top"][i] + data["height"][i] for i in idx)
-        rtl = sum(bool(_RTL_CHARS.search(w)) for w in words) * 2 >= len(words)
-        text = " ".join(words)
+        text = _visual_line(data, idx)
         box_w, box_h = (right - left) * sx, (bottom - top) * sy
         length = font.text_length(text, 1)
         size = min(box_h, box_w / length) if length else box_h
         if size <= 0:
             continue
         try:
-            tw.append((left * sx, bottom * sy - box_h * 0.15), text,
-                      font=font, fontsize=size, right_to_left=rtl)
+            tw.append((left * sx, bottom * sy - box_h * 0.15), text, font=font, fontsize=size)
         except Exception as e:  # a glyph the font can't encode — skip that line only
             logger.debug(f"text layer line skipped: {e}")
     tw.write_text(page, render_mode=3)  # 3 = invisible
