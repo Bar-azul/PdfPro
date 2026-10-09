@@ -27,13 +27,84 @@ RTL_LANGS = {"iw", "he", "ar", "fa", "ur", "yi"}
 _DIR_TO_ROTATE = {(1, 0): 0, (0, -1): 90, (-1, 0): 180, (0, 1): 270}
 
 
-def _html_block(text: str, font_size: float, is_rtl: bool) -> str:
+def _html_block(text: str, font_size: float, is_rtl: bool, color: int = 0, bold: bool = False,
+                gap: float = 0) -> str:
     """One paragraph of translated text as HTML; dir=auto lets mixed lines order themselves."""
     body = html.escape(text, quote=False).replace("\n", "<br>")
     # no text-align: the default "start" is right for rtl and left for ltr
     direction = "rtl" if is_rtl else "auto"
-    return (f'<p dir="{direction}" style="margin:0 0 6px 0;font-size:{font_size:.1f}px;'
-            f'line-height:1.2">{body}</p>')
+    weight = "font-weight:bold;" if bold else ""
+    return (f'<p dir="{direction}" style="margin:0 0 {gap:.0f}px 0;font-size:{font_size:.1f}px;'
+            f'line-height:1.15;color:#{color & 0xFFFFFF:06x};{weight}">{body}</p>')
+
+
+_PUA = re.compile(r"[\uE000-\uF8FF]")
+
+
+def _text_units(page: "fitz.Page", erase_icons: bool = False) -> list[dict]:
+    """
+    The pieces of a page to translate, one per line — except lines that wrap
+    into the next one (same size, near the full block width), which are joined
+    into one sentence. Translating whole MuPDF blocks sent entire menu columns
+    as one text: the model garbled it and the result was squeezed into one box.
+
+    Each unit: text, rect to write into (from the line's start to the block's
+    edge, so a longer translation still fits), font size, colour, bold, angle,
+    and the exact span boxes to erase. Icon glyphs (private-use characters) stay
+    in place, except for right-to-left targets, where the text moves to the
+    right edge and an icon left behind would sit on top of it.
+    """
+    units = []
+    for block in page.get_text("dict")["blocks"]:
+        if block.get("type") != 0:
+            continue
+        bx0, by0, bx1, by1 = block["bbox"]
+        bw = max(1.0, bx1 - bx0)
+        current = None
+        for line in block["lines"]:
+            spans = [sp for sp in line["spans"] if _PUA.sub("", sp["text"]).strip()]
+            if not spans:
+                continue
+            text = _PUA.sub("", "".join(sp["text"] for sp in line["spans"])).strip()
+            size = sorted(sp["size"] for sp in spans)[len(spans) // 2]
+            lx0, ly0, lx1, ly1 = line["bbox"]
+            boxes = [fitz.Rect(sp["bbox"]) for sp in (line["spans"] if erase_icons else spans)]
+            if (current and abs(size - current["size"]) < 0.6
+                    and abs(lx0 - current["x0"]) < 6
+                    and ly0 - current["y1"] < size * 0.8
+                    and current["last_w"] >= 0.8 * bw):
+                current["text"] += " " + text
+                current["y1"] = ly1
+                current["last_w"] = lx1 - lx0
+                current["redact"] += boxes
+                continue
+            sp0 = spans[0]
+            dx, dy = line["dir"]
+            current = {
+                "text": text, "size": size, "x0": lx0, "y0": ly0, "y1": ly1,
+                "last_w": lx1 - lx0, "redact": boxes, "block_x1": bx1,
+                "color": sp0.get("color", 0), "bold": bool(sp0.get("flags", 0) & 16),
+                "angle": _DIR_TO_ROTATE.get((round(dx), round(dy)), 0),
+            }
+            units.append(current)
+    out = []
+    prev_bottom = {}
+    for u in units:
+        if len(u["text"]) < 2:
+            continue
+        # PDF line boxes can overlap the line above (tall ascenders); start below it
+        key = round(u["x0"])
+        if u["angle"] == 0 and key in prev_bottom and u["y0"] < prev_bottom[key] < u["y1"]:
+            u["y0"] = prev_bottom[key]
+        prev_bottom[key] = u["y1"]
+        if u["angle"] == 0:
+            rect = fitz.Rect(u["x0"], u["y0"], max(u["block_x1"], u["x0"] + 20), u["y1"])
+        else:  # sideways text: keep the original box
+            rect = fitz.Rect(u["redact"][0])
+            for r in u["redact"][1:]:
+                rect |= r
+        out.append({**u, "rect": rect, "size": max(5, min(u["size"], 36))})
+    return out
 
 
 class TranslateService:
@@ -97,48 +168,34 @@ class TranslateService:
                 if not (0 <= i < doc.page_count):
                     continue
                 page = doc[i]
-                found = []
-                for block in page.get_text("dict")["blocks"]:
-                    if block.get("type") != 0 or not block.get("lines"):
-                        continue
-                    text = "\n".join(
-                        "".join(span["text"] for span in line["spans"]) for line in block["lines"]
-                    ).strip()
-                    if len(text) < 2:
-                        continue
-                    found.append((block, text))
-
-                stats["tried"] += len(found)
-                translations = translator.translate_many([t for _b, t in found]) if found else []
+                units = _text_units(page, erase_icons=is_rtl)
+                stats["tried"] += len(units)
+                translations = translator.translate_many([u["text"] for u in units]) if units else []
                 placed = []
-                for (block, text), translated in zip(found, translations):
+                for unit, translated in zip(units, translations):
                     if translated is None:
                         stats["failed"] += 1
                         continue
-                    if not translated or translated == text:
+                    if not translated or translated == unit["text"]:
                         continue
-                    sizes = [span["size"] for line in block["lines"] for span in line["spans"] if span["text"].strip()]
-                    font_size = max(6, min(sorted(sizes)[len(sizes) // 2] if sizes else 11, 28))
-                    # follow the direction of the original lines (text can run sideways on
-                    # scanned/rotated pages); coordinates here are unrotated page space
-                    dx, dy = block["lines"][0]["dir"]
-                    angle = _DIR_TO_ROTATE.get((round(dx), round(dy)), 0)
-                    placed.append((fitz.Rect(block["bbox"]), translated, font_size, angle))
+                    placed.append((unit, translated))
 
                 if not placed:
                     continue
                 # Remove the original words (a white box alone would leave them selectable
                 # underneath), but keep images and drawings.
-                for rect, *_rest in placed:
-                    page.add_redact_annot(rect, fill=(1, 1, 1))
+                for unit, _t in placed:
+                    for r in unit["redact"]:
+                        page.add_redact_annot(r, fill=False)
                 page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE,
                                       graphics=fitz.PDF_REDACT_LINE_ART_NONE)
-                for rect, translated, font_size, angle in placed:
+                for unit, translated in placed:
                     # insert_htmlbox shapes Hebrew/Arabic, orders bidi text and wraps lines
                     # correctly, and shrinks the text if the translation is longer.
                     page.insert_htmlbox(
-                        rect, _html_block(translated, font_size, is_rtl),
-                        rotate=angle, scale_low=0,
+                        unit["rect"],
+                        _html_block(translated, unit["size"], is_rtl, unit["color"], unit["bold"]),
+                        rotate=unit["angle"], scale_low=0,
                     )
 
             out = _temp_pdf("translated")
@@ -174,7 +231,7 @@ class TranslateService:
                 stats["failed"] += sum(t is None for t in translated)
                 translated = [t if t is not None else o for t, o in zip(translated, paragraphs)]
 
-                html = "".join(_html_block(par, 11, is_rtl) for par in translated if par.strip())
+                html = "".join(_html_block(par, 11, is_rtl, gap=6) for par in translated if par.strip())
                 mediabox = fitz.Rect(0, 0, page.rect.width, page.rect.height)
                 where = mediabox + (50, 50, -50, -50)
                 story = fitz.Story(html=html)
