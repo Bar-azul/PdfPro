@@ -7,13 +7,14 @@ import asyncio
 import time
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, Request, File, Form, Query, UploadFile
+from fastapi import APIRouter, Depends, HTTPException, Request, File, Form, Query, UploadFile
 
 from ..middleware.rate_limit import limiter
 from ..models.schemas import CompressRequest, CompressResult, FileResult, MergeRequest, RotateRequest, SplitRequest, SplitResult
 from .auth import get_optional_user
 from ..services.pdf_service import PDFService
 from ..services.storage_service import StorageService
+from ..utils.errors import ApiError
 from ..utils.file_utils import PDF_ONLY, make_file_response, validate_upload
 
 router = APIRouter()
@@ -35,11 +36,9 @@ async def merge_pdfs(
     t0 = time.time()
 
     if len(files) < 2:
-        from fastapi import HTTPException
-        raise HTTPException(status_code=400, detail="נדרשים לפחות 2 קבצי PDF למיזוג")
+        raise ApiError(400, "merge_need_two", "Select at least 2 PDF files to merge.")
     if len(files) > 20:
-        from fastapi import HTTPException
-        raise HTTPException(status_code=400, detail="מקסימום 20 קבצים לפעולה אחת")
+        raise ApiError(400, "too_many_files", "You can merge up to 20 files at a time.")
 
     upload_paths: list[Path] = []
     for f in files:
@@ -84,31 +83,36 @@ async def split_pdf(
     stem = Path(file.filename or "split").stem
 
     if mode == "ranges":
-        if not ranges:
-            from fastapi import HTTPException
-            raise HTTPException(400, detail="'ranges' חובה למצב 'ranges'")
+        if not ranges or not ranges.strip():
+            raise ApiError(400, "split_bad_range", "Enter the page ranges to split, e.g. 1-3, 4-6.")
         range_list = [r.strip() for r in ranges.split(",") if r.strip()]
+        PDFService.check_ranges(upload_meta["path"], range_list)
         result_paths = await asyncio.to_thread(
             PDFService.split_by_ranges, upload_meta["path"], range_list
         )
     elif mode == "every_n":
         if not every_n or every_n < 1:
-            from fastapi import HTTPException
-            raise HTTPException(400, detail="'every_n' חובה להיות מספר חיובי")
+            raise ApiError(400, "split_bad_range", "The number of pages per file must be 1 or more.")
         result_paths = await asyncio.to_thread(
             PDFService.split_every_n, upload_meta["path"], every_n
         )
     elif mode == "pages":
-        if not pages:
-            from fastapi import HTTPException
-            raise HTTPException(400, detail="'pages' חובה למצב 'pages'")
-        page_list = [int(p) for p in pages.split(",") if p.strip().isdigit()]
+        # validate every entry, so "1,abc" is an error instead of silently dropping "abc";
+        # ranges such as "2-4" are accepted here too
+        raw = [p.strip() for p in (pages or "").split(",") if p.strip()]
+        PDFService.check_ranges(upload_meta["path"], raw or [""])
+        import fitz
+        with fitz.open(upload_meta["path"]) as _doc:
+            total = _doc.page_count
+        page_list = []
+        for entry in raw:
+            start, _, end = entry.replace(" ", "").partition("-")
+            page_list.extend(range(int(start), min(int(end or start), total) + 1))
         result_paths = [
             await asyncio.to_thread(PDFService.extract_pages, upload_meta["path"], page_list)
         ]
     else:
-        from fastapi import HTTPException
-        raise HTTPException(400, detail=f"מצב לא מוכר: {mode}")
+        raise HTTPException(400, detail=f"Unknown split mode: {mode}")
 
     parts = []
     for i, path in enumerate(result_paths):
@@ -143,8 +147,7 @@ async def compress_pdf(
     """
     t0 = time.time()
     if level not in ("low", "medium", "high", "extreme"):
-        from fastapi import HTTPException
-        raise HTTPException(400, detail=f"רמת דחיסה לא חוקית: {level}")
+        raise HTTPException(400, detail=f"Unknown compression level: {level}")
 
     data = await validate_upload(file, allowed_mimes=PDF_ONLY, is_pro=_is_pro(user))
     original_size = len(data)
@@ -181,8 +184,7 @@ async def rotate_pdf(
     """Rotate all or selected PDF pages by 90, 180, or 270 degrees."""
     t0 = time.time()
     if angle not in (90, 180, 270):
-        from fastapi import HTTPException
-        raise HTTPException(400, detail="זווית חייבת להיות 90, 180, או 270")
+        raise HTTPException(400, detail="The angle must be 90, 180 or 270")
 
     page_list = [int(p) for p in pages.split(",") if p.strip().isdigit()] if pages else None
 

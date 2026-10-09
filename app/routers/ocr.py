@@ -41,6 +41,16 @@ async def ocr_extract(
     allowed = PDF_ONLY | IMAGE_TYPES
     page_list = [int(p) for p in pages.split(",") if p.strip().isdigit()] if pages else None
 
+    requested = [l.strip() for l in (language or "").split("+") if l.strip()]
+    installed = set(await asyncio.to_thread(OCRService.get_available_languages))
+    unknown = [l for l in requested if l not in installed]
+    if not requested or unknown:
+        from ..utils.errors import ApiError
+        raise ApiError(400, "ocr_bad_language",
+                       f"Unsupported OCR language: {', '.join(unknown) or language!r}. "
+                       f"Available: {', '.join(sorted(installed))}")
+    language = "+".join(requested)
+
     data = await validate_upload(file, allowed_mimes=allowed, is_pro=_is_pro(user))
     upload_meta = await StorageService.save_upload(data, file.filename or "upload")
 
@@ -96,7 +106,7 @@ async def ocr_extract(
             output_meta["size"], t0,
         )
 
-    raise HTTPException(400, detail=f"פורמט פלט לא נתמך: {output_format}")
+    raise HTTPException(400, detail=f"Unsupported output format: {output_format}")
 
 
 @router.get("/languages", summary="List available OCR languages")

@@ -4,6 +4,7 @@ OCRService — memory optimized + auto-rotation + image enhancement.
 
 import gc
 import logging
+import re
 import time
 from pathlib import Path
 
@@ -25,8 +26,10 @@ def _is_image(path: Path) -> bool:
 
 
 def _image_to_pdf(image_path: Path) -> Path:
-    with Image.open(image_path) as img:
-        if img.mode in ("RGBA", "P"):
+    from PIL import ImageOps
+    with Image.open(image_path) as raw:
+        img = ImageOps.exif_transpose(raw)
+        if img.mode in ("RGBA", "P", "LA"):
             img = img.convert("RGB")
         elif img.mode not in ("RGB", "L"):
             img = img.convert("RGB")
@@ -35,7 +38,7 @@ def _image_to_pdf(image_path: Path) -> Path:
     return out
 
 
-def _prepare_image(img: Image.Image) -> Image.Image:
+def _prepare_image(img: Image.Image, with_angle: bool = False):
     """
     Prepare image for best OCR accuracy:
     1. Resize if too large
@@ -57,6 +60,7 @@ def _prepare_image(img: Image.Image) -> Image.Image:
         img = img.convert("RGB")
 
     # Step 3 — Auto-detect and fix rotation
+    angle = 0
     try:
         osd = pytesseract.image_to_osd(
             img,
@@ -75,7 +79,73 @@ def _prepare_image(img: Image.Image) -> Image.Image:
     img = ImageEnhance.Contrast(img).enhance(2.0)
     img = ImageEnhance.Sharpness(img).enhance(2.0)
 
-    return img
+    return (img, angle or 0) if with_angle else img
+
+
+_RTL_CHARS = re.compile(r"[\u0590-\u08FF\uFB1D-\uFDFF\uFE70-\uFEFF]")
+_FONT_FILES = [
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+]
+_layer_font = None
+
+
+def _get_layer_font() -> fitz.Font:
+    """A font with Hebrew/Arabic glyphs if one is installed (the text is invisible, so
+    the look doesn't matter, but real glyphs give viewers correct word widths)."""
+    global _layer_font
+    if _layer_font is None:
+        for path in _FONT_FILES:
+            if Path(path).exists():
+                _layer_font = fitz.Font(fontfile=path)
+                break
+        else:
+            _layer_font = fitz.Font("helv")
+    return _layer_font
+
+
+def _text_layer(img_w: int, img_h: int, data: dict, w_pt: float, h_pt: float):
+    """
+    Build a one-page PDF (w_pt x h_pt, the OCR image's frame) holding the OCR
+    result as invisible text, one string per detected line. Text is written in
+    logical order with right_to_left set for Hebrew/Arabic lines, so copy and
+    search return the words the right way round.
+    """
+    font = _get_layer_font()
+    sx, sy = w_pt / img_w, h_pt / img_h
+    lines: dict[tuple, list[int]] = {}
+    for i, word in enumerate(data["text"]):
+        if not word.strip() or float(data["conf"][i]) < 0:
+            continue
+        key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
+        lines.setdefault(key, []).append(i)
+    if not lines:
+        return None
+
+    layer = fitz.open()
+    page = layer.new_page(width=w_pt, height=h_pt)
+    tw = fitz.TextWriter(page.rect)
+    for idx in lines.values():
+        words = [data["text"][i].strip() for i in idx]
+        left = min(data["left"][i] for i in idx)
+        right = max(data["left"][i] + data["width"][i] for i in idx)
+        top = min(data["top"][i] for i in idx)
+        bottom = max(data["top"][i] + data["height"][i] for i in idx)
+        rtl = sum(bool(_RTL_CHARS.search(w)) for w in words) * 2 >= len(words)
+        text = " ".join(words)
+        box_w, box_h = (right - left) * sx, (bottom - top) * sy
+        length = font.text_length(text, 1)
+        size = min(box_h, box_w / length) if length else box_h
+        if size <= 0:
+            continue
+        try:
+            tw.append((left * sx, bottom * sy - box_h * 0.15), text,
+                      font=font, fontsize=size, right_to_left=rtl)
+        except Exception as e:  # a glyph the font can't encode — skip that line only
+            logger.debug(f"text layer line skipped: {e}")
+    tw.write_text(page, render_mode=3)  # 3 = invisible
+    return layer
 
 
 class OCRService:
@@ -175,57 +245,52 @@ class OCRService:
     def extract_to_searchable_pdf(
         pdf_path: Path, language: str = "heb+eng", dpi: int = 200
     ) -> Path:
+        """
+        Keep every page exactly as it looks and add an invisible text layer on top,
+        word lines placed where Tesseract found them — so Ctrl+F, copy and
+        screen readers work, in Hebrew/Arabic too.
+        """
         t0 = time.time()
-        is_img = _is_image(pdf_path)
+        converted = None
+        if _is_image(pdf_path):
+            converted = pdf_path = _image_to_pdf(pdf_path)
 
-        # ── IMAGE: OCR directly → create PDF → add text layer ─────────────────
-        if is_img:
-            result = OCRService.ocr_image(pdf_path, language=language)
-            ocr_text = result["text"]
-            actual_path = _image_to_pdf(pdf_path)
-            try:
-                with fitz.open(actual_path) as doc:
-                    if ocr_text.strip():
-                        try:
-                            doc[0].insert_text(
-                                fitz.Point(10, 20),
-                                ocr_text,
-                                fontsize=1,
-                                color=(1, 1, 1),
-                                overlay=False,
-                            )
-                        except Exception as e:
-                            logger.warning(f"insert_text failed: {e}")
-                    out = _temp_pdf("searchable")
-                    doc.save(out, deflate=True)
-            finally:
-                actual_path.unlink(missing_ok=True)
-                gc.collect()
-            logger.info(f"Searchable PDF (image) in {_ms(t0)}ms")
-            return out
-
-        # ── PDF: page by page OCR → add text layer ────────────────────────────
-        results = OCRService.extract_text(pdf_path, language=language, dpi=dpi)
-        text_by_page = {r["page"]: r["text"] for r in results}
-
-        with fitz.open(pdf_path) as doc:
-            for page_num, text in text_by_page.items():
-                if not text.strip():
-                    continue
-                try:
-                    doc[page_num - 1].insert_text(
-                        fitz.Point(10, 20),
-                        text,
-                        fontsize=1,
-                        color=(1, 1, 1),
-                        overlay=False,
+        try:
+            matrix = fitz.Matrix(dpi / 72, dpi / 72)
+            with fitz.open(pdf_path) as doc:
+                for page in doc:
+                    # pages that already have real text are searchable as they are
+                    if len(page.get_text().strip()) > 50:
+                        continue
+                    pix = page.get_pixmap(matrix=matrix, alpha=False)  # as it looks (rotation applied)
+                    img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+                    del pix
+                    img, osd_angle = _prepare_image(img, with_angle=True)
+                    data = pytesseract.image_to_data(
+                        img, lang=language, config="--oem 3 --psm 3",
+                        output_type=pytesseract.Output.DICT,
                     )
-                except Exception as e:
-                    logger.warning(f"insert_text failed page {page_num}: {e}")
-            out = _temp_pdf("searchable")
-            doc.save(out, deflate=True)
+                    vis_w, vis_h = page.rect.width, page.rect.height
+                    if osd_angle % 180:
+                        vis_w, vis_h = vis_h, vis_w
+                    layer = _text_layer(img.width, img.height, data, vis_w, vis_h)
+                    del img
+                    if layer is None:
+                        continue
+                    with layer:
+                        target = (page.rect * page.derotation_matrix).normalize()
+                        page.show_pdf_page(
+                            target, layer, 0, overlay=True,
+                            rotate=(page.rotation + osd_angle) % 360,
+                        )
+                    gc.collect()
+                out = _temp_pdf("searchable")
+                doc.save(out, deflate=True, garbage=3)
+        finally:
+            if converted is not None:
+                converted.unlink(missing_ok=True)
+            gc.collect()
 
-        gc.collect()
         logger.info(f"Searchable PDF in {_ms(t0)}ms")
         return out
 
@@ -264,8 +329,9 @@ class OCRService:
         """
         t0 = time.time()
 
-        with Image.open(image_path) as img:
-            img = _prepare_image(img)
+        from PIL import ImageOps
+        with Image.open(image_path) as raw:
+            img = _prepare_image(ImageOps.exif_transpose(raw))
             data = pytesseract.image_to_data(
                 img,
                 lang=language,

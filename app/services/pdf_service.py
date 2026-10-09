@@ -82,6 +82,25 @@ class PDFService:
         return outputs
 
     @staticmethod
+    def check_ranges(pdf_path: Path, ranges: list[str]) -> None:
+        """Validate 1-based page ranges ("1-3", "5") before splitting; raise a clear 400."""
+        from ..utils.errors import ApiError
+        with fitz.open(pdf_path) as src:
+            total = src.page_count
+        for rng in ranges:
+            m = re.fullmatch(r"\s*(\d+)\s*(?:-\s*(\d+)\s*)?", rng or "")
+            if not m:
+                raise ApiError(400, "split_bad_range",
+                               f"'{rng}' is not a valid page range. Use numbers like 1-3 or 5.")
+            start = int(m.group(1)); end = int(m.group(2) or m.group(1))
+            if start < 1 or end < start:
+                raise ApiError(400, "split_bad_range",
+                               f"'{rng}' is not a valid page range. Use numbers like 1-3 or 5.")
+            if start > total:
+                raise ApiError(400, "split_out_of_range",
+                               f"Page {start} doesn't exist — this PDF has {total} pages.")
+
+    @staticmethod
     def split_every_n(pdf_path: Path, n: int) -> list[Path]:
         """Split a PDF into chunks of N pages each."""
         t0 = time.time()

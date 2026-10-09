@@ -10,6 +10,9 @@ RUN apt-get update && apt-get install -y \
     tesseract-ocr-eng \
     # LibreOffice (for Office → PDF)
     libreoffice \
+    # Fonts with Hebrew/Arabic glyphs (OCR text layer, Office → PDF)
+    fonts-dejavu-core \
+    culmus \
     # Build tools
     gcc \
     g++ \

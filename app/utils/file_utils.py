@@ -54,6 +54,7 @@ async def validate_upload(
     allowed_mimes: set | None = None,
     max_mb: int | None = None,
     is_pro: bool = False,
+    allow_encrypted: bool = False,
 ) -> bytes:
     """
     Read and validate an uploaded file.
@@ -65,7 +66,7 @@ async def validate_upload(
     if mime not in allowed:
         raise HTTPException(
             status_code=415,
-            detail=f"סוג קובץ לא נתמך: {mime}. נתמך: {', '.join(sorted(allowed))}",
+            detail=f"Unsupported file type: {mime or 'unknown'}. Supported: {', '.join(sorted(allowed))}",
         )
 
     # Read file
@@ -79,10 +80,36 @@ async def validate_upload(
     if size_mb > limit:
         raise HTTPException(
             status_code=413,
-            detail=f"הקובץ גדול מדי ({size_mb:.1f}MB). מקסימום: {limit}MB",
+            detail=f"The file is too large ({size_mb:.1f}MB). Maximum: {limit}MB",
         )
 
+    if mime == "application/pdf":
+        check_pdf_bytes(data, allow_encrypted=allow_encrypted)
+
     return data
+
+
+def check_pdf_bytes(data: bytes, allow_encrypted: bool = False) -> None:
+    """
+    Reject files that aren't usable PDFs with a clear 400 instead of letting the
+    tool crash later with a 500: not a PDF / damaged, no pages, or locked with a
+    password (only the unlock tool accepts locked files).
+    """
+    import fitz
+    from .errors import EMPTY_PDF, ENCRYPTED_PDF, INVALID_PDF, api_error
+
+    if not data:
+        raise api_error(400, INVALID_PDF)
+    try:
+        with fitz.open(stream=data, filetype="pdf") as doc:
+            if doc.needs_pass and not allow_encrypted:
+                raise api_error(400, ENCRYPTED_PDF)
+            if not doc.needs_pass and doc.page_count == 0:
+                raise api_error(400, EMPTY_PDF)
+    except HTTPException:
+        raise
+    except Exception:
+        raise api_error(400, INVALID_PDF)
 
 
 def make_file_response(

@@ -8,6 +8,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import re
 import time
 import uuid
 from pathlib import Path
@@ -58,6 +59,76 @@ def _safe_unlink(path: Path) -> None:
         pass
 
 
+_RTL_RE = re.compile(r"[\u0590-\u08FF\uFB1D-\uFDFF\uFE70-\uFEFF]")
+_NUMBER_RE = re.compile(r"^(-)?\s*([\d,]*\d(?:\.\d+)?)\s*(-)?$")
+
+
+def _has_rtl(text: str) -> bool:
+    return bool(_RTL_RE.search(text or ""))
+
+
+def _cell_text(page, bbox) -> str:
+    """Text inside one table cell, in reading order (PyMuPDF orders RTL text correctly)."""
+    if not bbox:
+        return ""
+    text = page.get_text("text", clip=fitz.Rect(bbox)).strip()
+    return " ".join(part.strip() for part in text.splitlines() if part.strip())
+
+
+def _excel_value(raw: str):
+    """'12,450.00' → 12450.0 with a thousands format; '412.90-' (RTL minus) → -412.9."""
+    m = _NUMBER_RE.match(raw.replace("\u200f", "").replace("\u200e", "").strip()) if raw else None
+    if not m or (m.group(1) and m.group(3)):
+        return raw, None
+    digits = m.group(2)
+    if "," in digits and not re.fullmatch(r"\d{1,3}(,\d{3})+(\.\d+)?", digits):
+        return raw, None  # commas that aren't thousands separators — leave as text
+    number = float(digits.replace(",", ""))
+    if m.group(1) or m.group(3):
+        number = -number
+    decimals = len(digits.split(".")[1]) if "." in digits else 0
+    if decimals == 0 and "," not in digits and len(digits) > 1 and digits.startswith("0"):
+        return raw, None  # leading zeros (IDs, account numbers) stay text
+    if len(digits.replace(",", "").replace(".", "")) > 15:
+        return raw, None  # too long for Excel precision (card/account numbers)
+    fmt = "#,##0" + ("." + "0" * decimals if decimals else "") if "," in digits or decimals else None
+    return (int(number) if decimals == 0 else number), fmt
+
+
+# EXIF orientation → counter-clockwise rotation for insert_image (no re-encoding needed)
+_EXIF_ROTATE = {3: 180, 6: 270, 8: 90}
+
+
+def _image_for_pdf(img_path: Path):
+    """
+    Returns (stream or None, upright width px, upright height px, rotate).
+    Phone photos store "turn me" in EXIF instead of rotating the pixels; honour it so
+    portrait photos don't come out lying on their side. Plain rotations keep the
+    original bytes; mirrored orientations and formats PDF can't hold are re-encoded.
+    """
+    import io
+    from PIL import ImageOps
+    with Image.open(img_path) as im:
+        try:
+            orientation = im.getexif().get(0x0112, 1)
+        except Exception:
+            orientation = 1
+        w, h = im.size
+        if orientation in (1, None) or orientation not in range(1, 9):
+            needs_reencode = im.format not in ("JPEG", "PNG")
+            if not needs_reencode:
+                return None, w, h, 0
+        elif orientation in _EXIF_ROTATE and im.format in ("JPEG", "PNG"):
+            rot = _EXIF_ROTATE[orientation]
+            return (None, h, w, rot) if rot in (90, 270) else (None, w, h, rot)
+        upright = ImageOps.exif_transpose(im)
+        if upright.mode not in ("RGB", "L", "RGBA", "LA"):
+            upright = upright.convert("RGBA" if "A" in upright.getbands() else "RGB")
+        buf = io.BytesIO()
+        upright.save(buf, format="PNG")
+        return buf.getvalue(), upright.width, upright.height, 0
+
+
 class ConvertService:
 
     @staticmethod
@@ -77,9 +148,14 @@ class ConvertService:
 
     @staticmethod
     def pdf_to_excel(pdf_path: Path) -> Path:
-        import pdfplumber
+        """
+        Tables → one sheet per table (cells keep their row/column, numbers become real
+        numbers). Pages without a ruled table go to a sheet with their text lines.
+        Text is read with PyMuPDF so Hebrew/Arabic comes out in reading order.
+        """
         import openpyxl
         from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+        from ..utils.errors import ApiError
 
         t0 = time.time()
         pdf_path = Path(pdf_path).resolve()
@@ -89,41 +165,58 @@ class ConvertService:
 
         header_font = Font(bold=True, color="FFFFFF", name="Calibri", size=11)
         header_fill = PatternFill(fill_type="solid", fgColor="0D1B2A")
-        border = Border(
-            left=Side(style="thin"), right=Side(style="thin"),
-            top=Side(style="thin"),  bottom=Side(style="thin"),
-        )
-        found_any_table = False
+        side = Side(style="thin")
+        border = Border(left=side, right=side, top=side, bottom=side)
+        any_text = False
 
-        with pdfplumber.open(str(pdf_path)) as pdf:
-            for page_num, page in enumerate(pdf.pages, start=1):
-                tables = page.extract_tables()
-                if tables:
-                    found_any_table = True
-                    for tbl_num, table in enumerate(tables, start=1):
-                        ws_name = f"עמ' {page_num}" + (f" טבלה {tbl_num}" if tbl_num > 1 else "")
-                        ws = wb.create_sheet(title=ws_name[:31])
-                        for row_idx, row in enumerate(table, start=1):
-                            for col_idx, cell in enumerate(row, start=1):
-                                c = ws.cell(row=row_idx, column=col_idx, value=cell or "")
-                                c.border = border
-                                c.alignment = Alignment(wrap_text=True, horizontal="right")
-                                if row_idx == 1:
-                                    c.font = header_font
-                                    c.fill = header_fill
-                        for col in ws.columns:
-                            max_len = max((len(str(c.value)) if c.value else 0 for c in col), default=10)
-                            ws.column_dimensions[col[0].column_letter].width = min(max_len + 4, 60)
-                else:
-                    text = page.extract_text() or ""
-                    ws = wb.create_sheet(title=f"עמ' {page_num} טקסט"[:31])
-                    for line_num, line in enumerate(text.splitlines(), start=1):
-                        ws.cell(row=line_num, column=1, value=line)
-                gc.collect()  # ← נקה בין עמודים
+        with fitz.open(pdf_path) as doc:
+            for page_num, page in enumerate(doc, start=1):
+                page_text = page.get_text().strip()
+                any_text = any_text or bool(page_text)
+                try:
+                    tables = page.find_tables().tables
+                except Exception as e:  # table detection is best-effort
+                    logger.warning(f"find_tables failed on page {page_num}: {e}")
+                    tables = []
+                tables = [t for t in tables if t.row_count >= 2 and t.col_count >= 2]
 
-        if not wb.worksheets:
-            ws = wb.create_sheet(title="ריק")
-            ws.cell(row=1, column=1, value="לא נמצאו טבלאות")
+                for tbl_num, table in enumerate(tables, start=1):
+                    name = f"Page {page_num}" + (f" table {tbl_num}" if len(tables) > 1 else "")
+                    ws = wb.create_sheet(title=name[:31])
+                    widths: dict[int, int] = {}
+                    for row_idx, row in enumerate(table.rows, start=1):
+                        for col_idx, bbox in enumerate(row.cells, start=1):
+                            raw = _cell_text(page, bbox)
+                            value, number_format = _excel_value(raw)
+                            c = ws.cell(row=row_idx, column=col_idx, value=value)
+                            c.border = border
+                            if number_format:
+                                c.number_format = number_format
+                            c.alignment = Alignment(
+                                wrap_text=True, vertical="top",
+                                horizontal="right" if _has_rtl(raw) else None,
+                            )
+                            if row_idx == 1:
+                                c.font = header_font
+                                c.fill = header_fill
+                            widths[col_idx] = max(widths.get(col_idx, 8), len(raw))
+                    for col_idx, w in widths.items():
+                        ws.column_dimensions[openpyxl.utils.get_column_letter(col_idx)].width = min(w + 4, 60)
+
+                if not tables and page_text:
+                    ws = wb.create_sheet(title=f"Page {page_num} text"[:31])
+                    ws.column_dimensions["A"].width = 100
+                    lines = [ln.strip() for ln in page_text.splitlines() if ln.strip()]
+                    for line_num, line in enumerate(lines, start=1):
+                        c = ws.cell(row=line_num, column=1, value=line)
+                        if _has_rtl(line):
+                            c.alignment = Alignment(horizontal="right")
+                gc.collect()
+
+        if not any_text:
+            _safe_unlink(out)
+            raise ApiError(400, "no_text",
+                           "This PDF has no selectable text (it looks like a scan). Run OCR first, then convert.")
 
         wb.save(str(out))
         gc.collect()
@@ -256,8 +349,7 @@ class ConvertService:
 
         try:
             for img_path in image_paths:
-                with Image.open(img_path) as pil_img:
-                    w_px, h_px = pil_img.size
+                stream, w_px, h_px, rotate = _image_for_pdf(img_path)
                 w_pt = w_px * 72 / 96
                 h_pt = h_px * 72 / 96
 
@@ -275,7 +367,10 @@ class ConvertService:
                     (rect.width  + w_pt * scale) / 2,
                     (rect.height + h_pt * scale) / 2,
                 )
-                page.insert_image(img_rect, filename=str(img_path))
+                if stream is None:
+                    page.insert_image(img_rect, filename=str(img_path), rotate=rotate)
+                else:
+                    page.insert_image(img_rect, stream=stream, rotate=rotate)
                 gc.collect()
 
             out = _temp_pdf("from_images")
