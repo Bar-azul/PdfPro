@@ -76,13 +76,42 @@ async def health():
     return {"status": "ok", "version": "1.0.0"}
 
 
+# ── Error responses ───────────────────────────────────────────────────────────
+from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request, exc):
+    """{"detail": "...", "code": "..."} — code lets the site show a translated message."""
+    code = getattr(exc, "code", None) or f"http_{exc.status_code}"
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail, "code": code},
+        headers=getattr(exc, "headers", None),
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request, exc):
+    """Turn FastAPI's 422 list into one readable sentence instead of raw JSON."""
+    problems = []
+    for err in exc.errors():
+        field = next((str(p) for p in reversed(err.get("loc", ())) if not isinstance(p, int)), "input")
+        if field in ("body", "query", "form"):
+            field = "input"
+        problems.append(f"{field}: {err.get('msg', 'invalid value')}")
+    detail = "Invalid request — " + "; ".join(problems) if problems else "Invalid request"
+    return JSONResponse(status_code=422, content={"detail": detail, "code": "invalid_input"})
+
+
 # ── Global exception handler ──────────────────────────────────────────────────
 @app.exception_handler(Exception)
 async def global_exception_handler(request, exc):
     logger.error(f"Unhandled exception: {exc}", exc_info=True)
     return JSONResponse(
         status_code=500,
-        content={"detail": "Internal server error. Please try again later."},
+        content={"detail": "Internal server error. Please try again later.", "code": "server_error"},
     )
 
 from fastapi.responses import HTMLResponse

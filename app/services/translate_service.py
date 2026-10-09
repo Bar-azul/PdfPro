@@ -5,74 +5,33 @@ Translates PDF content using deep-translator (Google Translate, free tier).
 Supports 40+ languages including Hebrew, Arabic, and RTL languages.
 """
 
+import html
+import io
 import logging
-import os
 import time
 from pathlib import Path
 
 import fitz
 from deep_translator import GoogleTranslator
 
-try:
-    from bidi.algorithm import get_display
-    from arabic_reshaper import reshape
-    BIDI_AVAILABLE = True
-except ImportError:
-    BIDI_AVAILABLE = False
-
 from ..services.pdf_service import _temp_pdf, _ms
+from ..utils.errors import ApiError
 
 logger = logging.getLogger(__name__)
 
 _CHUNK_SIZE = 4500
 RTL_LANGS = {"iw", "he", "ar", "fa", "ur", "yi"}
-
-_FONT_CANDIDATES = [
-    "C:/Windows/Fonts/arial.ttf",
-    "C:/Windows/Fonts/Arial.ttf",
-    "C:/Windows/Fonts/tahoma.ttf",
-    "C:/Windows/Fonts/Tahoma.ttf",
-    "C:/Windows/Fonts/times.ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-]
+# line direction (from get_text "dict") → insert_htmlbox rotate value
+_DIR_TO_ROTATE = {(1, 0): 0, (0, -1): 90, (-1, 0): 180, (0, 1): 270}
 
 
-def _get_font_path() -> str | None:
-    for path in _FONT_CANDIDATES:
-        if os.path.exists(path):
-            return path
-    return None
-
-
-def _fix_rtl(text: str, lang: str) -> str:
-    """
-    Fix RTL text display in PDF:
-    - If python-bidi is installed: use proper BiDi algorithm (best quality)
-    - Fallback: reverse words per line (works for Hebrew without library)
-    """
-    if not text:
-        return text
-
-    if BIDI_AVAILABLE:
-        try:
-            # Arabic needs reshaping before BiDi
-            if lang == "ar":
-                text = reshape(text)
-            return get_display(text)
-        except Exception as e:
-            logger.debug(f"BiDi failed, using fallback: {e}")
-
-    # Fallback — reverse words per line
-    lines = text.splitlines()
-    fixed = []
-    for line in lines:
-        words = line.split()
-        if words:
-            fixed.append(" ".join(reversed(words)))
-        else:
-            fixed.append(line)
-    return "\n".join(fixed)
+def _html_block(text: str, font_size: float, is_rtl: bool) -> str:
+    """One paragraph of translated text as HTML; dir=auto lets mixed lines order themselves."""
+    body = html.escape(text, quote=False).replace("\n", "<br>")
+    # no text-align: the default "start" is right for rtl and left for ltr
+    direction = "rtl" if is_rtl else "auto"
+    return (f'<p dir="{direction}" style="margin:0 0 6px 0;font-size:{font_size:.1f}px;'
+            f'line-height:1.2">{body}</p>')
 
 
 class TranslateService:
@@ -88,24 +47,30 @@ class TranslateService:
         t0 = time.time()
         translator = GoogleTranslator(source=source_language, target=target_language)
         is_rtl = target_language in RTL_LANGS
-        font_path = _get_font_path()
-
-        if not BIDI_AVAILABLE and is_rtl:
-            logger.warning(
-                "python-bidi not installed — RTL text may appear reversed. "
-                "Run: pip install python-bidi arabic-reshaper"
-            )
+        stats = {"tried": 0, "failed": 0}
 
         if preserve_layout:
             out = TranslateService._translate_overlay(
-                pdf_path, translator, is_rtl, target_language, pages, font_path
+                pdf_path, translator, is_rtl, pages, stats
             )
         else:
             out = TranslateService._translate_clean(
-                pdf_path, translator, is_rtl, target_language, pages, font_path
+                pdf_path, translator, is_rtl, pages, stats
             )
 
-        logger.info(f"Translated PDF ({source_language}→{target_language}) in {_ms(t0)}ms")
+        if stats["tried"] == 0:
+            out.unlink(missing_ok=True)
+            raise ApiError(400, "translate_no_text",
+                           "This PDF has no selectable text to translate. If it is a scan, run OCR first.")
+        if stats["failed"] == stats["tried"]:
+            out.unlink(missing_ok=True)
+            raise ApiError(502, "translate_failed",
+                           "The translation service is not responding right now. Please try again in a few minutes.")
+
+        logger.info(
+            f"Translated PDF ({source_language}→{target_language}) in {_ms(t0)}ms, "
+            f"{stats['failed']}/{stats['tried']} blocks failed"
+        )
         return out
 
     # ── Overlay strategy ──────────────────────────────────────────────────────
@@ -115,11 +80,10 @@ class TranslateService:
         pdf_path: Path,
         translator: GoogleTranslator,
         is_rtl: bool,
-        lang: str,
         pages: list[int] | None,
-        font_path: str | None,
+        stats: dict,
     ) -> Path:
-        """Cover each text block with white, then overlay translated text."""
+        """Cover each text block with white, then lay the translation into the same box."""
         with fitz.open(pdf_path) as doc:
             target = [p - 1 for p in pages] if pages else range(doc.page_count)
 
@@ -127,53 +91,49 @@ class TranslateService:
                 if not (0 <= i < doc.page_count):
                     continue
                 page = doc[i]
-                blocks = page.get_text("blocks")
-
-                for block in blocks:
-                    x0, y0, x1, y1, text, *_ = block
-                    text = text.strip()
-                    if not text or len(text) < 2:
+                placed = []
+                for block in page.get_text("dict")["blocks"]:
+                    if block.get("type") != 0 or not block.get("lines"):
+                        continue
+                    text = "\n".join(
+                        "".join(span["text"] for span in line["spans"]) for line in block["lines"]
+                    ).strip()
+                    if len(text) < 2:
                         continue
 
+                    stats["tried"] += 1
                     translated = _safe_translate(translator, text)
+                    if translated is None:
+                        stats["failed"] += 1
+                        continue
                     if not translated or translated == text:
                         continue
+                    sizes = [span["size"] for line in block["lines"] for span in line["spans"] if span["text"].strip()]
+                    font_size = max(6, min(sorted(sizes)[len(sizes) // 2] if sizes else 11, 28))
+                    # follow the direction of the original lines (text can run sideways on
+                    # scanned/rotated pages); coordinates here are unrotated page space
+                    dx, dy = block["lines"][0]["dir"]
+                    angle = _DIR_TO_ROTATE.get((round(dx), round(dy)), 0)
+                    placed.append((fitz.Rect(block["bbox"]), translated, font_size, angle))
 
-                    # Fix RTL direction
-                    if is_rtl:
-                        translated = _fix_rtl(translated, lang)
-
-                    rect = fitz.Rect(x0, y0, x1, y1)
-                    page.draw_rect(rect, color=(1, 1, 1), fill=(1, 1, 1), overlay=True)
-
-                    lines = max(text.count("\n") + 1, 1)
-                    font_size = max(7, min((y1 - y0) / lines * 0.75, 13))
-
-                    try:
-                        kwargs = dict(
-                            fontsize=font_size,
-                            color=(0, 0, 0),
-                            align=2 if is_rtl else 0,
-                            overlay=True,
-                        )
-                        if font_path:
-                            kwargs["fontfile"] = font_path
-                            kwargs["fontname"] = "custom"
-                        page.insert_textbox(rect, translated, **kwargs)
-                    except Exception as e:
-                        logger.debug(f"insert_textbox failed: {e}")
-                        try:
-                            page.insert_text(
-                                fitz.Point(x0 + 2, y0 + font_size + 2),
-                                translated,
-                                fontsize=font_size,
-                                color=(0, 0, 0),
-                            )
-                        except Exception:
-                            pass
+                if not placed:
+                    continue
+                # Remove the original words (a white box alone would leave them selectable
+                # underneath), but keep images and drawings.
+                for rect, *_rest in placed:
+                    page.add_redact_annot(rect, fill=(1, 1, 1))
+                page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE,
+                                      graphics=fitz.PDF_REDACT_LINE_ART_NONE)
+                for rect, translated, font_size, angle in placed:
+                    # insert_htmlbox shapes Hebrew/Arabic, orders bidi text and wraps lines
+                    # correctly, and shrinks the text if the translation is longer.
+                    page.insert_htmlbox(
+                        rect, _html_block(translated, font_size, is_rtl),
+                        rotate=angle, scale_low=0,
+                    )
 
             out = _temp_pdf("translated")
-            doc.save(out, deflate=True)
+            doc.save(out, deflate=True, garbage=3)
         return out
 
     # ── Clean strategy ────────────────────────────────────────────────────────
@@ -183,11 +143,10 @@ class TranslateService:
         pdf_path: Path,
         translator: GoogleTranslator,
         is_rtl: bool,
-        lang: str,
         pages: list[int] | None,
-        font_path: str | None,
+        stats: dict,
     ) -> Path:
-        """Create a new clean PDF with translated text only."""
+        """Create a new clean PDF with the translated text only (flows onto extra pages if needed)."""
         with fitz.open(pdf_path) as doc:
             target = [p - 1 for p in pages] if pages else range(doc.page_count)
             new_doc = fitz.open()
@@ -195,56 +154,40 @@ class TranslateService:
             for i in target:
                 if not (0 <= i < doc.page_count):
                     continue
-
                 page = doc[i]
-                original_text = page.get_text()
-                translated = _safe_translate(translator, original_text) or original_text
+                original_text = page.get_text().strip()
+                if not original_text:
+                    new_doc.new_page(width=page.rect.width, height=page.rect.height)
+                    continue
 
-                # Fix RTL direction
-                if is_rtl:
-                    translated = _fix_rtl(translated, lang)
+                stats["tried"] += 1
+                translated = _safe_translate(translator, original_text)
+                if translated is None:
+                    stats["failed"] += 1
+                    translated = original_text
 
-                new_page = new_doc.new_page(
-                    width=page.rect.width,
-                    height=page.rect.height,
+                html = "".join(
+                    _html_block(par, 11, is_rtl) for par in translated.split("\n\n") if par.strip()
                 )
+                mediabox = fitz.Rect(0, 0, page.rect.width, page.rect.height)
+                where = mediabox + (50, 50, -50, -50)
+                story = fitz.Story(html=html)
+                buf = io.BytesIO()
+                writer = fitz.DocumentWriter(buf)
+                more = 1
+                while more:
+                    dev = writer.begin_page(mediabox)
+                    more, _ = story.place(where)
+                    story.draw(dev)
+                    writer.end_page()
+                writer.close()
+                with fitz.open("pdf", buf.getvalue()) as part:
+                    new_doc.insert_pdf(part)
 
-                margin = 50
-                text_rect = fitz.Rect(
-                    margin, margin,
-                    new_page.rect.width - margin,
-                    new_page.rect.height - margin,
-                )
-
-                try:
-                    kwargs = dict(
-                        fontsize=11,
-                        color=(0, 0, 0),
-                        align=2 if is_rtl else 0,
-                    )
-                    if font_path:
-                        kwargs["fontfile"] = font_path
-                        kwargs["fontname"] = "custom"
-                    new_page.insert_textbox(text_rect, translated, **kwargs)
-                except Exception as e:
-                    logger.debug(f"insert_textbox failed on page {i}: {e}")
-                    y = margin + 15
-                    for line in translated.splitlines():
-                        if y > new_page.rect.height - margin:
-                            break
-                        try:
-                            new_page.insert_text(
-                                fitz.Point(margin, y),
-                                line,
-                                fontsize=11,
-                                color=(0, 0, 0),
-                            )
-                        except Exception:
-                            pass
-                        y += 16
-
+            if new_doc.page_count == 0:
+                new_doc.new_page()
             out = _temp_pdf("translated")
-            new_doc.save(out, deflate=True)
+            new_doc.save(out, deflate=True, garbage=3)
             new_doc.close()
 
         return out
@@ -256,9 +199,10 @@ class TranslateService:
         source_language: str = "auto",
     ) -> str:
         translator = GoogleTranslator(source=source_language, target=target_language)
-        result = _safe_translate(translator, text) or text
-        if target_language in RTL_LANGS:
-            result = _fix_rtl(result, target_language)
+        result = _safe_translate(translator, text)
+        if result is None:
+            raise ApiError(502, "translate_failed",
+                           "The translation service is not responding right now. Please try again in a few minutes.")
         return result
 
     @staticmethod

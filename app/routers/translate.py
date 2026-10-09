@@ -41,7 +41,7 @@ async def translate_pdf(
 
     if target_language not in SUPPORTED_LANGUAGES and target_language != "auto":
         from fastapi import HTTPException
-        raise HTTPException(400, detail=f"שפה לא נתמכת: {target_language}. השתמש ב-/api/translate/languages לרשימה מלאה.")
+        raise HTTPException(400, detail=f"Unsupported language: {target_language}")
 
     page_list = [int(p) for p in pages.split(",") if p.strip().isdigit()] if pages else None
 

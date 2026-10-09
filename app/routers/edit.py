@@ -63,7 +63,7 @@ async def add_watermark(
     else:
         if not text:
             from fastapi import HTTPException
-            raise HTTPException(400, detail="נדרש טקסט לסימן מים מסוג 'text'")
+            raise HTTPException(400, detail="Enter the watermark text")
         rgb = _hex_to_rgb(color)
         result_path = await asyncio.to_thread(
             PDFService.add_text_watermark,
@@ -115,38 +115,49 @@ async def sign_pdf(
             page_idx = max(0, min(page_idx, doc.page_count - 1))
             pg = doc[page_idx]
 
-            r = pg.rect
+            # Work in the page as the user sees it (x/y come from the preview), then map
+            # into PDF space: on pages with /Rotate the stored coordinates are turned.
+            r = pg.rect  # visual size
             sig_w = r.width * 0.25
             sig_h = 50 if img_bytes else 40
             # keep the whole box (and the date line) inside the page
             sig_x = min(max(r.width * x, 10), r.width - sig_w - 10)
             sig_y = min(max(r.height * y, 10), r.height - sig_h - 20)
+            to_pdf = pg.derotation_matrix
+            turn = pg.rotation  # content must turn with the page to look upright
+
+            def place(rect: "fitz.Rect") -> "fitz.Rect":
+                return (rect * to_pdf).normalize()
+
             rect = fitz.Rect(sig_x, sig_y, sig_x + sig_w, sig_y + sig_h)
 
             if img_bytes:
                 # Drawn signature: placed as-is, no frame, like ink on paper
                 try:
-                    pg.insert_image(rect, stream=img_bytes, keep_proportion=True, overlay=True)
+                    pg.insert_image(place(rect), stream=img_bytes, keep_proportion=True,
+                                    overlay=True, rotate=turn)
                 except Exception:
                     raise ValueError("bad_image")
             else:
-                pg.draw_rect(rect, color=(0, 0, 0.6), width=0.5)
+                pg.draw_rect(place(rect), color=(0, 0, 0.6), width=0.5)
                 # insert_htmlbox handles Hebrew/Arabic fonts and RTL order
                 # (insert_text's built-in font has no Hebrew glyphs and renders dots).
                 import html as _html
                 pg.insert_htmlbox(
-                    fitz.Rect(sig_x + 4, sig_y + 2, sig_x + sig_w - 4, sig_y + sig_h - 2),
+                    place(fitz.Rect(sig_x + 4, sig_y + 2, sig_x + sig_w - 4, sig_y + sig_h - 2)),
                     f'<div dir="auto" style="font-size:18px;color:#0000b3;text-align:center">'
                     f'{_html.escape(text, quote=False)}</div>',
+                    rotate=turn,
                 )
 
             if add_date:
                 from datetime import datetime
                 pg.insert_text(
-                    fitz.Point(sig_x + 6, sig_y + sig_h + 12),
+                    fitz.Point(sig_x + 6, sig_y + sig_h + 12) * to_pdf,
                     datetime.now().strftime("%d/%m/%Y"),
                     fontsize=8,
                     color=(0.4, 0.4, 0.4),
+                    rotate=turn,
                 )
 
             out = _temp_pdf("signed")
@@ -205,13 +216,13 @@ async def unlock_pdf(
 ):
     """Remove password protection from a PDF (requires the correct password)."""
     t0 = time.time()
-    data = await validate_upload(file, allowed_mimes=PDF_ONLY, is_pro=_is_pro(user))
+    data = await validate_upload(file, allowed_mimes=PDF_ONLY, is_pro=_is_pro(user), allow_encrypted=True)
     upload_meta = await StorageService.save_upload(data, file.filename or "upload.pdf")
     try:
         result_path = await asyncio.to_thread(PDFService.unlock, upload_meta["path"], password)
     except ValueError:
-        from fastapi import HTTPException
-        raise HTTPException(403, detail="סיסמה שגויה")
+        from ..utils.errors import ApiError
+        raise ApiError(403, "wrong_password", "Wrong password. Check it and try again.")
     out_name = f"{Path(file.filename or 'unlocked').stem}_unlocked.pdf"
     output_meta = await StorageService.save_output(result_path, out_name)
     return make_file_response(
