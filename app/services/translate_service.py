@@ -16,6 +16,7 @@ import fitz
 import httpx
 from deep_translator import GoogleTranslator
 
+from ..config import settings
 from ..services.pdf_service import _temp_pdf, _ms
 from ..utils.errors import ApiError
 
@@ -230,9 +231,10 @@ _BATCH_CHARS = 1500  # per request; keeps the GET URL well under URL-length limi
 
 class _Translator:
     """
-    Google Translate through the public "gtx" JSON endpoint (the one the browser
-    widget uses), batching many text blocks into one request; deep-translator's
-    page scraper is the fallback. One request per block — the old way — gets an
+    Translation routes, best first: Azure AI Translator and Google Cloud
+    Translation when their keys are set (official APIs, work from cloud servers),
+    then Google's public "gtx" endpoint and deep-translator's page scraper —
+    those two are free but Google blocks them from datacenter IPs (Render). One request per block — the old way — gets an
     IP throttled after a few dozen blocks.
     """
 
@@ -245,6 +247,61 @@ class _Translator:
         # circuit breaker: after 3 failures in a row a route is skipped for this
         # document, so a blocked service fails fast instead of retrying every block
         self._fails: dict[str, int] = {}
+
+    # ── official APIs (used when a key is configured) ─────────────────────────
+
+    def _routes_many(self):
+        """Routes that take a list of texts, best first."""
+        routes = []
+        if settings.AZURE_TRANSLATOR_KEY:
+            routes.append(self._azure)
+        if settings.GOOGLE_TRANSLATE_API_KEY:
+            routes.append(self._gcloud)
+        return routes
+
+    def _azure(self, texts: list[str]) -> list[str]:
+        """Azure AI Translator v3: up to 1000 texts / 50k chars per call (we send ≤ 1500 chars)."""
+        params = {"api-version": "3.0", "to": _azure_code(self.target)}
+        if self.source and self.source != "auto":
+            params["from"] = _azure_code(self.source)
+        headers = {"Ocp-Apim-Subscription-Key": settings.AZURE_TRANSLATOR_KEY,
+                   "Content-Type": "application/json"}
+        if settings.AZURE_TRANSLATOR_REGION:
+            headers["Ocp-Apim-Subscription-Region"] = settings.AZURE_TRANSLATOR_REGION
+        r = self._client.post("https://api.cognitive.microsofttranslator.com/translate",
+                              params=params, headers=headers, json=[{"Text": t} for t in texts])
+        if r.status_code != 200:
+            raise RuntimeError(f"azure HTTP {r.status_code}: {r.text[:200]}")
+        return [item["translations"][0]["text"] for item in r.json()]
+
+    def _gcloud(self, texts: list[str]) -> list[str]:
+        """Google Cloud Translation v2 (official, keyed)."""
+        body = {"q": texts, "target": self.target, "format": "text"}
+        if self.source and self.source != "auto":
+            body["source"] = self.source
+        r = self._client.post("https://translation.googleapis.com/language/translate/v2",
+                              params={"key": settings.GOOGLE_TRANSLATE_API_KEY}, json=body)
+        if r.status_code != 200:
+            raise RuntimeError(f"gcloud HTTP {r.status_code}: {r.text[:200]}")
+        return [html.unescape(t["translatedText"]) for t in r.json()["data"]["translations"]]
+
+    def _try_many(self, texts: list[str]) -> list[str] | None:
+        """Batch through the official APIs; None if none is configured or all failed."""
+        for route in self._routes_many():
+            name = route.__name__
+            if not self._available(name):
+                continue
+            try:
+                out = route(texts)
+                if len(out) == len(texts):
+                    self._record(name, True)
+                    return out
+                raise RuntimeError(f"{name}: got {len(out)} results for {len(texts)} texts")
+            except Exception as e:
+                self._record(name, False)
+                self.last_error = f"{name}: {e}"
+                logger.warning(f"Translation failed via {name}: {e}")
+        return None
 
     def _available(self, name: str) -> bool:
         return self._fails.get(name, 0) < 3
@@ -284,6 +341,10 @@ class _Translator:
         out = []
         for chunk in chunks:
             done = None
+            official = self._try_many([chunk])
+            if official:
+                out.append(official[0])
+                continue
             for route in (self._gtx, self._deep):
                 name = route.__name__
                 if not self._available(name):
@@ -311,6 +372,12 @@ class _Translator:
         def flush():
             nonlocal batch, size
             if not batch:
+                return
+            official = self._try_many([texts[i] for i in batch])
+            if official:
+                for i, part in zip(batch, official):
+                    results[i] = part.strip()
+                batch, size = [], 0
                 return
             lines = [" ".join(texts[i].split()) for i in batch]
             joined = None
@@ -343,6 +410,11 @@ class _Translator:
             size += n + 1
         flush()
         return results
+
+
+def _azure_code(code: str) -> str:
+    """Google-style codes → Azure codes where they differ."""
+    return {"iw": "he", "zh": "zh-Hans", "zh-CN": "zh-Hans", "zh-TW": "zh-Hant", "jw": "jv"}.get(code, code)
 
 
 def _chunks(text: str, limit: int) -> list[str]:
