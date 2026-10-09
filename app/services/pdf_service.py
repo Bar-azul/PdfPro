@@ -343,6 +343,7 @@ class PDFService:
                             # Fragments of a match split across lines don't contain the whole text,
                             # so they are kept: when in doubt, redact rather than leak.
                             def _wrong_case(r):
+                                """True if this hit's line holds the text, but only in another case."""
                                 box = page.get_textbox(r + (-1, -1, 1, 1))
                                 return text.lower() in box.lower() and text not in box
                             rects = [r for r in rects if not _wrong_case(r)]
@@ -438,11 +439,13 @@ def _image_display_widths(doc):
 
 
 def _scale_for(width_px, shown_width_pt, threshold, target):
+    """Resize factor for an image: target/actual DPI if shown above the threshold, else 1."""
     dpi = width_px / (shown_width_pt / 72.0)
     return target / dpi if dpi > threshold else 1.0
 
 
 def _finish(img, scale):
+    """Apply the remaining resize (LANCZOS) after any cheap pre-shrink; no-op near 1.0."""
     if scale < 0.98:
         size = (max(1, round(img.width * scale)), max(1, round(img.height * scale)))
         if img.size != size:
@@ -496,6 +499,8 @@ def _decode_jpeg_scaled(doc, xref, shown_width_pt, threshold, target):
 
 
 def _decode_with_mupdf(doc, xref, shown_width_pt, threshold, target):
+    """Decode any image MuPDF understands and return an RGB or gray PIL image at the target
+    size, or None if it has transparency. Non-Device colour spaces are converted by MuPDF."""
     pix = fitz.Pixmap(doc, xref)            # Flate/JPX/CMYK/ICC/Decode arrays, decoded by MuPDF
     if pix.alpha or pix.colorspace is None:
         return None
@@ -522,6 +527,9 @@ def _decode_with_mupdf(doc, xref, shown_width_pt, threshold, target):
 
 
 def _recompress_image(doc, xref, shown_width_pt, threshold, target, quality):
+    """Replace one image stream with a smaller JPEG and a matching image dictionary.
+    Skips masks/transparency, 1-bit images, small or unplaced images, and anything that
+    wouldn't get smaller. Raises on unexpected errors; the caller leaves the image as is."""
     obj = doc.xref_object(xref, compressed=True)
     # Leave alone anything we can't faithfully re-encode: masks/transparency, stencils, 1-bit scans.
     if any(k in obj for k in ("/SMask", "/Mask", "/ImageMask")):
