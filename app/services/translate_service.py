@@ -7,6 +7,7 @@ Supports 40+ languages including Hebrew, Arabic, and RTL languages.
 
 import html
 import io
+import json
 import logging
 import re
 import time
@@ -296,7 +297,7 @@ _BATCH_CHARS = 1500  # per request; keeps the GET URL well under URL-length limi
 class _Translator:
     """
     Translation routes, best first: Azure AI Translator, Google Cloud
-    Translation and Cloudflare Workers AI (m2m100) when their keys are set
+    Translation and Cloudflare Workers AI (a chat model, then m2m100) when their keys are set
     (official APIs, work from cloud servers),
     then Google's public "gtx" endpoint and deep-translator's page scraper —
     those two are free but Google blocks them from datacenter IPs (Render). One request per block — the old way — gets an
@@ -325,6 +326,8 @@ class _Translator:
         if settings.GOOGLE_TRANSLATE_API_KEY:
             routes.append(self._gcloud)
         if settings.CLOUDFLARE_ACCOUNT_ID and settings.CLOUDFLARE_API_TOKEN:
+            if settings.CLOUDFLARE_LLM_MODEL:
+                routes.append(self._cloudflare_llm)
             routes.append(self._cloudflare)
         return routes
 
@@ -353,6 +356,52 @@ class _Translator:
         if r.status_code != 200:
             raise RuntimeError(f"gcloud HTTP {r.status_code}: {r.text[:200]}")
         return [html.unescape(t["translatedText"]) for t in r.json()["data"]["translations"]]
+
+    def _cloudflare_llm(self, texts: list[str]) -> list[str]:
+        """
+        Cloudflare Workers AI chat model (Gemma by default). Much better than m2m100
+        on short, name-heavy text such as menus: m2m100 translates dish names word by
+        word and loops ("tomato tomato tomato"). The whole batch goes in one call as
+        numbered JSON so the model sees the context; any missing or broken item
+        fails the batch and the next route (m2m100) takes it.
+        """
+        from ..models.schemas import SUPPORTED_LANGUAGES
+        url = (f"https://api.cloudflare.com/client/v4/accounts/{settings.CLOUDFLARE_ACCOUNT_ID}"
+               f"/ai/run/{settings.CLOUDFLARE_LLM_MODEL}")
+        headers = {"Authorization": f"Bearer {settings.CLOUDFLARE_API_TOKEN}"}
+        target = f"{SUPPORTED_LANGUAGES.get(self.target, self.target)} (language code {self.target})"
+        source = ("" if self.source in ("", "auto") else
+                  f" from {SUPPORTED_LANGUAGES.get(self.source, self.source)}")
+        system = (
+            f"You are a professional translator. Translate each value of the JSON object{source} "
+            f"into {target}. Rules: translate meaning naturally, not word by word. "
+            "Proper names, brand names and foreign dish names (e.g. Thai or Italian dishes) "
+            "are transliterated into the target script, not translated literally. "
+            "Keep numbers, prices, currency codes, units, times, e-mail addresses, URLs and "
+            "markers such as (V), (N), (P) exactly as they are. Keep the same keys. "
+            "Reply with the JSON object only, no explanations."
+        )
+        payload = {str(i + 1): t for i, t in enumerate(texts)}
+        body = {
+            "messages": [{"role": "system", "content": system},
+                         {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
+            "temperature": 0.1,
+            "max_tokens": min(8000, 400 + 4 * sum(len(t) for t in texts)),
+            "chat_template_kwargs": {"enable_thinking": False},
+        }
+        r = self._client.post(url, headers=headers, json=body, timeout=120)
+        if r.status_code != 200:
+            raise RuntimeError(f"cloudflare-llm HTTP {r.status_code}: {r.text[:200]}")
+        data = _llm_json(_llm_text(r.json()))
+        out = []
+        for i, src in enumerate(texts):
+            val = data.get(str(i + 1))
+            if not isinstance(val, str) or not val.strip() or _degenerate(src, val):
+                raise RuntimeError(f"cloudflare-llm: bad item {i + 1}")
+            out.append(val.strip())
+        if self.on_progress:
+            self.on_progress(1.0)
+        return out
 
     def _cloudflare(self, texts: list[str]) -> list[str]:
         """
@@ -383,7 +432,8 @@ class _Translator:
                                   json={"text": text, "source_lang": src, "target_lang": target})
             if r.status_code != 200:
                 raise RuntimeError(f"cloudflare HTTP {r.status_code}: {r.text[:200]}")
-            return r.json()["result"]["translated_text"]
+            out = r.json()["result"]["translated_text"]
+            return text if _degenerate(text, out) else out
 
         results = []
         with ThreadPoolExecutor(max_workers=16) as pool:
@@ -544,6 +594,46 @@ class _Translator:
 
 
 _HAS_LETTER = re.compile(r"[^\W\d_]")
+
+
+def _degenerate(src: str, out: str) -> bool:
+    """
+    True for machine-translation loops: the same word three or more times in a
+    row ("tomato tomato tomato") when the source has no such run, or an output
+    far longer than its source.
+    """
+    def run(text: str) -> int:
+        words = re.findall(r"[^\W\d_]+", text.lower())
+        best = cur = 1 if words else 0
+        for a, b in zip(words, words[1:]):
+            cur = cur + 1 if a == b else 1
+            best = max(best, cur)
+        return best
+    if run(out) >= 3 and run(src) < 3:
+        return True
+    return len(out) > 4 * len(src) + 40
+
+
+def _llm_text(resp: dict) -> str:
+    """Reply text from Workers AI: classic {result: {response}} or OpenAI-style choices."""
+    res = resp.get("result", resp)
+    if isinstance(res.get("response"), str):
+        return res["response"]
+    if isinstance(res.get("response"), dict):  # some models parse JSON replies already
+        return json.dumps(res["response"], ensure_ascii=False)
+    choices = res.get("choices") or []
+    if choices:
+        return choices[0].get("message", {}).get("content") or choices[0].get("text") or ""
+    raise RuntimeError(f"cloudflare-llm: unexpected reply {str(resp)[:200]}")
+
+
+def _llm_json(text: str) -> dict:
+    """The JSON object in a model reply (tolerates code fences or a stray thought block)."""
+    text = re.sub(r"<(think|thought)>.*?</\1>", "", text, flags=re.S)
+    start, end = text.find("{"), text.rfind("}")
+    if start < 0 or end < start:
+        raise RuntimeError("cloudflare-llm: no JSON in reply")
+    return json.loads(text[start:end + 1])
 
 
 def _m2m_code(code: str) -> str:
