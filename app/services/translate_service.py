@@ -46,6 +46,18 @@ def _html_block(text: str, font_size: float, is_rtl: bool, color: int = 0, bold:
             f'line-height:1.15;color:#{color & 0xFFFFFF:06x};{weight}">{body}</p>')
 
 
+def _compact(doc: "fitz.Document"):
+    """
+    insert_htmlbox embeds a full copy of its fonts in every box, so a translated
+    4-page menu came out at 9.6 MB from a 150 KB original. Subsetting the fonts
+    (plus garbage=4 on save, which merges identical objects) brings it to ~0.3 MB.
+    """
+    try:
+        doc.subset_fonts()
+    except Exception as e:  # smaller file is nice to have, never a reason to fail
+        logger.warning(f"Font subsetting failed: {e}")
+
+
 _LATIN_GROUP = re.compile(r"\(([^()\u0590-\u05FF\u0600-\u06FF]*)\)")
 _PUA = re.compile(r"[\uE000-\uF8FF]")
 
@@ -217,7 +229,8 @@ class TranslateService:
                     )
 
             out = _temp_pdf("translated")
-            doc.save(out, deflate=True, garbage=3)
+            _compact(doc)
+            doc.save(out, deflate=True, garbage=4)
         return out
 
     # ── Clean strategy ────────────────────────────────────────────────────────
@@ -270,7 +283,8 @@ class TranslateService:
             if new_doc.page_count == 0:
                 new_doc.new_page()
             out = _temp_pdf("translated")
-            new_doc.save(out, deflate=True, garbage=3)
+            _compact(new_doc)
+            new_doc.save(out, deflate=True, garbage=4)
             new_doc.close()
 
         return out
@@ -393,9 +407,10 @@ class _Translator:
             "Grilled Satay\", \"Mango\" are translated, not kept).\n"
             "- Proper names, brand names and foreign dish names (e.g. \"Tom Yam Goong\") are "
             "transliterated into the target script, not translated literally, followed by "
-            "the original Latin spelling: e.g. a dish name becomes <transliteration> "
-            "<original Latin name>. Text in a third script (e.g. Thai) next to its Latin "
-            "romanization is dropped; on its own it is transliterated.\n"
+            "the original Latin spelling, written plainly with a space between them and "
+            "no brackets or quotes (for Hebrew, \"Tom Yam Goong\" becomes \"טום יאם גונג "
+            "Tom Yam Goong\"). Write each word once. Text in a third script (e.g. Thai) "
+            "next to its Latin romanization is dropped; on its own it is transliterated.\n"
             "- Keep numbers, prices, currency codes, units, times, e-mail addresses, URLs "
             "and markers such as (V), (N), (P) exactly as they are.\n"
             "- Return every key, never an empty value. Reply with the JSON object only, "
@@ -418,7 +433,9 @@ class _Translator:
             val = data.get(str(i + 1))
             if not isinstance(val, str) or not val.strip() or _degenerate(src, val):
                 raise RuntimeError(f"cloudflare-llm: bad item {i + 1}")
-            out.append(val.strip())
+            if "<" not in src and ">" not in src:  # the model sometimes copies <...> from the rules
+                val = val.replace("<", "").replace(">", "")
+            out.append(" ".join(val.split()) if "\n" not in src else val.strip())
         return out
 
     def _cloudflare(self, texts: list[str]) -> list[str]:
