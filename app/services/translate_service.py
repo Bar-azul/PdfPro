@@ -150,7 +150,21 @@ def _text_units(page: "fitz.Page", erase_icons: bool = False) -> list[dict]:
         typical = hidden[len(hidden) // 2]
         for u in out:
             if u["hidden"]:
-                u["size"] = max(typical * 0.85, min(u["size"], typical * 1.25))
+                # one body size for the page; clearly larger lines stay a bit larger
+                u["size"] = typical * 1.2 if u["size"] > typical * 1.3 else typical
+        # A translation is often longer than the scanned line it replaces. Rather
+        # than shrinking it to fit one line's height, let it wrap into the free
+        # space below, up to the next line in the same column (at most 2 more lines).
+        scanned = sorted((u for u in out if u["hidden"] and u["angle"] == 0), key=lambda u: u["rect"].y0)
+        for i, u in enumerate(scanned):
+            r = u["rect"]
+            limit = r.y1 + 2.4 * u["size"]
+            for v in scanned[i + 1:]:
+                w = v["rect"]
+                if w.y0 >= r.y1 - 1 and w.x0 < r.x1 and w.x1 > r.x0:
+                    limit = min(limit, w.y0)
+                    break
+            u["rect"] = fitz.Rect(r.x0, r.y0, r.x1, max(r.y1, min(limit, page.rect.y1)))
     return out
 
 
