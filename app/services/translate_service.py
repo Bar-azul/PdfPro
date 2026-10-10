@@ -32,6 +32,12 @@ _DIR_TO_ROTATE = {(1, 0): 0, (0, -1): 90, (-1, 0): 180, (0, 1): 270}
 def _html_block(text: str, font_size: float, is_rtl: bool, color: int = 0, bold: bool = False,
                 gap: float = 0) -> str:
     """One paragraph of translated text as HTML; dir=auto lets mixed lines order themselves."""
+    if is_rtl:
+        # "(V)" after Latin or a price in a right-to-left line: without marks the bidi
+        # algorithm gives the closing bracket the line's direction and it lands at
+        # the wrong end, mirrored ("(Tom Yam Hed (V"). LRMs on both sides keep the
+        # group together.
+        text = _LATIN_GROUP.sub("\u200e(\\1)\u200e", text)
     body = html.escape(text, quote=False).replace("\n", "<br>")
     # no text-align: the default "start" is right for rtl and left for ltr
     direction = "rtl" if is_rtl else "auto"
@@ -40,6 +46,7 @@ def _html_block(text: str, font_size: float, is_rtl: bool, color: int = 0, bold:
             f'line-height:1.15;color:#{color & 0xFFFFFF:06x};{weight}">{body}</p>')
 
 
+_LATIN_GROUP = re.compile(r"\(([^()\u0590-\u05FF\u0600-\u06FF]*)\)")
 _PUA = re.compile(r"[\uE000-\uF8FF]")
 
 
@@ -166,25 +173,30 @@ class TranslateService:
         with fitz.open(pdf_path) as doc:
             target = [p - 1 for p in pages] if pages else range(doc.page_count)
 
-            target = list(target)
-            for k, i in enumerate(target):
-                progress.update(k, len(target), "translating")
-                if not (0 <= i < doc.page_count):
-                    continue
+            target = [i for i in target if 0 <= i < doc.page_count]
+            n = len(target)
+            # Read every page first and translate the whole document in one go: the
+            # batches run in parallel, the model sees neighbouring lines, and text
+            # repeated on every page (footers, notes) is translated once.
+            page_units = [_text_units(doc[i], erase_icons=is_rtl) for i in target]
+            all_units = [u for units in page_units for u in units]
+            stats["tried"] += len(all_units)
+            progress.update(0, n, "translating")
+            translator.on_progress = lambda f: progress.update(0.95 * f * n, n, "translating")
+            translations = translator.translate_many([u["text"] for u in all_units]) if all_units else []
+
+            pos = 0
+            for i, units in zip(target, page_units):
                 page = doc[i]
-                units = _text_units(page, erase_icons=is_rtl)
-                translator.on_progress = (
-                    lambda f, k=k, n=len(target): progress.update(k + 0.9 * f, n, "translating"))
-                stats["tried"] += len(units)
-                translations = translator.translate_many([u["text"] for u in units]) if units else []
                 placed = []
-                for unit, translated in zip(units, translations):
+                for unit, translated in zip(units, translations[pos:pos + len(units)]):
                     if translated is None:
                         stats["failed"] += 1
                         continue
                     if not translated or translated == unit["text"]:
                         continue
                     placed.append((unit, translated))
+                pos += len(units)
 
                 if not placed:
                     continue
@@ -311,7 +323,7 @@ class _Translator:
         self._client = httpx.Client(timeout=20, headers={"User-Agent": "Mozilla/5.0"})
         self._fallback = None
         self._latin_lang: str | None = None
-        self.on_progress = None  # called with the fraction (0-1) of the current batch done  # document's Latin-script language, detected once
+        self.on_progress = None  # called with the fraction (0-1) of translate_many's batches done
         # circuit breaker: after 3 failures in a row a route is skipped for this
         # document, so a blocked service fails fast instead of retrying every block
         self._fails: dict[str, int] = {}
@@ -374,18 +386,26 @@ class _Translator:
                   f" from {SUPPORTED_LANGUAGES.get(self.source, self.source)}")
         system = (
             f"You are a professional translator. Translate each value of the JSON object{source} "
-            f"into {target}. Rules: translate meaning naturally, not word by word. "
-            "Proper names, brand names and foreign dish names (e.g. Thai or Italian dishes) "
-            "are transliterated into the target script, not translated literally. "
-            "Keep numbers, prices, currency codes, units, times, e-mail addresses, URLs and "
-            "markers such as (V), (N), (P) exactly as they are. Keep the same keys. "
-            "Reply with the JSON object only, no explanations."
+            f"into {target}. The values are consecutive lines of one document (headings, "
+            "titles, body text); treat them consistently. Rules:\n"
+            "- Translate meaning naturally, not word by word. Every word that has a meaning "
+            "is translated, also in titles and short lines (\"Seasonal fruits\", \"Mixed "
+            "Grilled Satay\", \"Mango\" are translated, not kept).\n"
+            "- Proper names, brand names and foreign dish names (e.g. \"Tom Yam Goong\") are "
+            "transliterated into the target script, not translated literally, followed by "
+            "the original Latin spelling: e.g. a dish name becomes <transliteration> "
+            "<original Latin name>. Text in a third script (e.g. Thai) next to its Latin "
+            "romanization is dropped; on its own it is transliterated.\n"
+            "- Keep numbers, prices, currency codes, units, times, e-mail addresses, URLs "
+            "and markers such as (V), (N), (P) exactly as they are.\n"
+            "- Return every key, never an empty value. Reply with the JSON object only, "
+            "no explanations."
         )
         payload = {str(i + 1): t for i, t in enumerate(texts)}
         body = {
             "messages": [{"role": "system", "content": system},
                          {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
-            "temperature": 0.1,
+            "temperature": 0,
             "max_tokens": min(8000, 400 + 4 * sum(len(t) for t in texts)),
             "chat_template_kwargs": {"enable_thinking": False},
         }
@@ -399,8 +419,6 @@ class _Translator:
             if not isinstance(val, str) or not val.strip() or _degenerate(src, val):
                 raise RuntimeError(f"cloudflare-llm: bad item {i + 1}")
             out.append(val.strip())
-        if self.on_progress:
-            self.on_progress(1.0)
         return out
 
     def _cloudflare(self, texts: list[str]) -> list[str]:
@@ -435,13 +453,8 @@ class _Translator:
             out = r.json()["result"]["translated_text"]
             return text if _degenerate(text, out) else out
 
-        results = []
-        with ThreadPoolExecutor(max_workers=16) as pool:
-            for r in pool.map(one, texts):
-                results.append(r)
-                if self.on_progress:
-                    self.on_progress(len(results) / len(texts))
-        return results
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            return list(pool.map(one, texts))
 
     def _try_many(self, texts: list[str]) -> list[str] | None:
         """Batch through the official APIs; None if none is configured or all failed."""
@@ -543,54 +556,86 @@ class _Translator:
         return out
 
     def _translate_unique(self, texts: list[str]) -> list[str | None]:
-        """Translate distinct blocks with few requests: one line per block, joined by newlines."""
+        """
+        Translate distinct blocks with few requests. Blocks are grouped into batches
+        of up to _BATCH_CHARS; with an official API the batches run 4 at a time
+        (a chat model takes ~15 s per batch, so a 4-page menu went from ~70 s to
+        ~20 s). Batches no official API could do go through gtx one line per block.
+        """
         results: list[str | None] = [None] * len(texts)
+        batches: list[list[int]] = []
         batch: list[int] = []
         size = 0
-
-        def flush():
-            nonlocal batch, size
-            if not batch:
-                return
-            # a block's line breaks are just where the PDF wrapped it: send it as one
-            # sentence (as the gtx path does) so it translates and re-wraps cleanly
-            official = self._try_many([" ".join(texts[i].split()) for i in batch])
-            if official:
-                for i, part in zip(batch, official):
-                    results[i] = part.strip()
-                batch, size = [], 0
-                return
-            lines = [" ".join(texts[i].split()) for i in batch]
-            joined = None
-            if self._available("_gtx"):
-                try:
-                    joined = self._gtx("\n".join(lines))
-                    self._record("_gtx", True)
-                except Exception as e:
-                    self._record("_gtx", False)
-                    self.last_error = f"_gtx: {e}"
-                    logger.warning(f"Batch translation failed: {e}")
-            parts = joined.split("\n") if joined else []
-            if len(parts) == len(batch):
-                for i, part in zip(batch, parts):
-                    results[i] = part.strip()
-            else:  # line count changed (or the batch failed): translate one by one
-                for i in batch:
-                    results[i] = self.translate(texts[i])
-            batch, size = [], 0
-
         for i, t in enumerate(texts):
             n = len(t)
-            if n > _BATCH_CHARS:
-                flush()
-                results[i] = self.translate(t)
+            if n > _BATCH_CHARS:  # long block: on its own, split into chunks by translate()
+                batches.append([i])
                 continue
-            if size + n > _BATCH_CHARS:
-                flush()
+            if batch and size + n > _BATCH_CHARS:
+                batches.append(batch)
+                batch, size = [], 0
             batch.append(i)
             size += n + 1
-        flush()
+        if batch:
+            batches.append(batch)
+
+        # a block's line breaks are just where the PDF wrapped it: send it as one
+        # sentence so it translates and re-wraps cleanly
+        flat = [" ".join(t.split()) for t in texts]
+        done = 0
+
+        def report():
+            if self.on_progress:
+                self.on_progress(done / len(batches))
+
+        def official(idx: list[int]):
+            if len(idx) == 1 and len(texts[idx[0]]) > _BATCH_CHARS:
+                return None
+            return self._try_many([flat[i] for i in idx])
+
+        pending = []
+        if self._routes_many():
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                for idx, out in zip(batches, pool.map(official, batches)):
+                    if out:
+                        for i, part in zip(idx, out):
+                            results[i] = part.strip()
+                        done += 1
+                        report()
+                    else:
+                        pending.append(idx)
+        else:
+            pending = batches
+
+        for idx in pending:
+            if len(idx) == 1 and len(texts[idx[0]]) > _BATCH_CHARS:
+                results[idx[0]] = self.translate(texts[idx[0]])
+            else:
+                self._gtx_batch(idx, flat, texts, results)
+            done += 1
+            report()
         return results
+
+    def _gtx_batch(self, idx: list[int], flat: list[str], texts: list[str],
+                   results: list[str | None]):
+        """One gtx request for a batch (one line per block), else block by block."""
+        joined = None
+        if self._available("_gtx"):
+            try:
+                joined = self._gtx("\n".join(flat[i] for i in idx))
+                self._record("_gtx", True)
+            except Exception as e:
+                self._record("_gtx", False)
+                self.last_error = f"_gtx: {e}"
+                logger.warning(f"Batch translation failed: {e}")
+        parts = joined.split("\n") if joined else []
+        if len(parts) == len(idx):
+            for i, part in zip(idx, parts):
+                results[i] = part.strip()
+        else:  # line count changed (or the batch failed): translate one by one
+            for i in idx:
+                results[i] = self.translate(texts[i])
 
 
 _HAS_LETTER = re.compile(r"[^\W\d_]")
