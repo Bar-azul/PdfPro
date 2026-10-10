@@ -30,7 +30,7 @@ _DIR_TO_ROTATE = {(1, 0): 0, (0, -1): 90, (-1, 0): 180, (0, 1): 270}
 
 
 def _html_block(text: str, font_size: float, is_rtl: bool, color: int = 0, bold: bool = False,
-                gap: float = 0) -> str:
+                gap: float = 0, align_right: bool = False) -> str:
     """One paragraph of translated text as HTML; dir=auto lets mixed lines order themselves."""
     if is_rtl:
         # "(V)" after Latin or a price in a right-to-left line: without marks the bidi
@@ -42,6 +42,8 @@ def _html_block(text: str, font_size: float, is_rtl: bool, color: int = 0, bold:
     # no text-align: the default "start" is right for rtl and left for ltr
     direction = "rtl" if is_rtl else "auto"
     weight = "font-weight:bold;" if bold else ""
+    if align_right and not is_rtl:
+        weight += "text-align:right;"
     return (f'<p dir="{direction}" style="margin:0 0 {gap:.0f}px 0;font-size:{font_size:.1f}px;'
             f'line-height:1.15;color:#{color & 0xFFFFFF:06x};{weight}">{body}</p>')
 
@@ -58,6 +60,7 @@ def _compact(doc: "fitz.Document"):
         logger.warning(f"Font subsetting failed: {e}")
 
 
+_RTL_TEXT = re.compile(r"[\u0590-\u05FF\u0600-\u06FF]")
 _LATIN_GROUP = re.compile(r"\(([^()\u0590-\u05FF\u0600-\u06FF]*)\)")
 _PUA = re.compile(r"[\uE000-\uF8FF]")
 
@@ -96,6 +99,7 @@ def _text_units(page: "fitz.Page", erase_icons: bool = False) -> list[dict]:
                     and current["last_w"] >= 0.8 * bw):
                 current["text"] += " " + text
                 current["y1"] = ly1
+                current["x1"] = max(current["x1"], lx1)
                 current["last_w"] = lx1 - lx0
                 current["redact"] += boxes
                 current["hidden"] = current["hidden"] and all(sp.get("alpha", 255) == 0 for sp in spans)
@@ -103,7 +107,8 @@ def _text_units(page: "fitz.Page", erase_icons: bool = False) -> list[dict]:
             sp0 = spans[0]
             dx, dy = line["dir"]
             current = {
-                "text": text, "size": size, "x0": lx0, "y0": ly0, "y1": ly1,
+                "text": text, "size": size, "x0": lx0, "x1": lx1, "y0": ly0, "y1": ly1,
+                "block_x0": bx0,
                 "last_w": lx1 - lx0, "redact": boxes, "block_x1": bx1,
                 "color": sp0.get("color", 0), "bold": bool(sp0.get("flags", 0) & 16),
                 "angle": _DIR_TO_ROTATE.get((round(dx), round(dy)), 0),
@@ -121,13 +126,31 @@ def _text_units(page: "fitz.Page", erase_icons: bool = False) -> list[dict]:
         if u["angle"] == 0 and key in prev_bottom and u["y0"] < prev_bottom[key] < u["y1"]:
             u["y0"] = prev_bottom[key]
         prev_bottom[key] = u["y1"]
-        if u["angle"] == 0:
+        u["align_right"] = False
+        if u["angle"] == 0 and not erase_icons and _RTL_TEXT.search(u["text"]):
+            # right-to-left source into a left-to-right language: the line starts at
+            # its right edge, so keep that edge and give the translation the room to
+            # its left (a short right-aligned Hebrew line otherwise left a sliver
+            # of space and the English shrank to nothing)
+            rect = fitz.Rect(u["block_x0"], u["y0"], max(u["x1"], u["block_x0"] + 20), u["y1"])
+            u["align_right"] = True
+        elif u["angle"] == 0:
             rect = fitz.Rect(u["x0"], u["y0"], max(u["block_x1"], u["x0"] + 20), u["y1"])
         else:  # sideways text: keep the original box
             rect = fitz.Rect(u["redact"][0])
             for r in u["redact"][1:]:
                 rect |= r
         out.append({**u, "rect": rect, "size": max(5, min(u["size"], 36))})
+    # OCR layers size each line to fit its width, so on a scan neighbouring lines
+    # of the same body text come out at very different sizes (and a translation
+    # set at those sizes looks like a ransom note). Keep scanned lines near the
+    # page's typical size: headings may stay a little larger.
+    hidden = sorted(u["size"] for u in out if u["hidden"])
+    if hidden:
+        typical = hidden[len(hidden) // 2]
+        for u in out:
+            if u["hidden"]:
+                u["size"] = max(typical * 0.85, min(u["size"], typical * 1.25))
     return out
 
 
@@ -222,6 +245,11 @@ class TranslateService:
                         # On a scanned page the original words are pixels in the image
                         # and the text is an invisible OCR layer: removing it would leave
                         # the scan's words under the translation, so paint them white.
+                        if unit["hidden"]:
+                            # OCR word boxes hug the letters; ink (bold, underlines,
+                            # descenders) spills past them, so cover a little more
+                            m = r.height * 0.25
+                            r = fitz.Rect(r.x0 - 2, r.y0 - m, r.x1 + 2, r.y1 + m) & page.rect
                         page.add_redact_annot(r, fill=(1, 1, 1) if unit["hidden"] else False)
                 page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE,
                                       graphics=fitz.PDF_REDACT_LINE_ART_NONE)
@@ -231,7 +259,8 @@ class TranslateService:
                     page.insert_htmlbox(
                         unit["rect"],
                         _html_block(translated, unit["size"], is_rtl,
-                                    0 if unit["hidden"] else unit["color"], unit["bold"]),
+                                    0 if unit["hidden"] else unit["color"], unit["bold"],
+                                    align_right=unit["align_right"]),
                         rotate=unit["angle"], scale_low=0,
                     )
 
