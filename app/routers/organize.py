@@ -26,7 +26,7 @@ def _is_pro(user): return user is not None and user.get("plan") in ("pro", "ente
 # ── Merge ──────────────────────────────────────────────────────────────────────
 
 @router.post("/merge", response_model=FileResult, summary="Merge multiple PDFs into one")
-@limiter.limit("100/hour")
+@limiter.limit("15/hour")
 async def merge_pdfs(
     request: Request,
     files: list[UploadFile] = File(..., description="2–20 PDF files to merge, in order"),
@@ -59,7 +59,7 @@ async def merge_pdfs(
 # ── Split ──────────────────────────────────────────────────────────────────────
 
 @router.post("/split", summary="Split a PDF into multiple files")
-@limiter.limit("100/hour")
+@limiter.limit("15/hour")
 async def split_pdf(
     request: Request,
     file: UploadFile = File(...),
@@ -128,7 +128,7 @@ async def split_pdf(
 # ── Compress ───────────────────────────────────────────────────────────────────
 
 @router.post("/compress", response_model=CompressResult, summary="Compress a PDF")
-@limiter.limit("50/hour")
+@limiter.limit("20/hour")
 async def compress_pdf(
     request: Request,
     file: UploadFile = File(...),
@@ -173,7 +173,7 @@ async def compress_pdf(
 # ── Rotate ─────────────────────────────────────────────────────────────────────
 
 @router.post("/rotate", response_model=FileResult, summary="Rotate PDF pages")
-@limiter.limit("100/hour")
+@limiter.limit("30/hour")
 async def rotate_pdf(
     request: Request,
     file: UploadFile = File(...),
