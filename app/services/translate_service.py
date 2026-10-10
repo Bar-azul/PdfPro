@@ -98,6 +98,7 @@ def _text_units(page: "fitz.Page", erase_icons: bool = False) -> list[dict]:
                 current["y1"] = ly1
                 current["last_w"] = lx1 - lx0
                 current["redact"] += boxes
+                current["hidden"] = current["hidden"] and all(sp.get("alpha", 255) == 0 for sp in spans)
                 continue
             sp0 = spans[0]
             dx, dy = line["dir"]
@@ -106,6 +107,8 @@ def _text_units(page: "fitz.Page", erase_icons: bool = False) -> list[dict]:
                 "last_w": lx1 - lx0, "redact": boxes, "block_x1": bx1,
                 "color": sp0.get("color", 0), "bold": bool(sp0.get("flags", 0) & 16),
                 "angle": _DIR_TO_ROTATE.get((round(dx), round(dy)), 0),
+                # invisible OCR text over a scan: the words people see are in the image
+                "hidden": all(sp.get("alpha", 255) == 0 for sp in spans),
             }
             units.append(current)
     out = []
@@ -216,7 +219,10 @@ class TranslateService:
                 # underneath), but keep images and drawings.
                 for unit, _t in placed:
                     for r in unit["redact"]:
-                        page.add_redact_annot(r, fill=False)
+                        # On a scanned page the original words are pixels in the image
+                        # and the text is an invisible OCR layer: removing it would leave
+                        # the scan's words under the translation, so paint them white.
+                        page.add_redact_annot(r, fill=(1, 1, 1) if unit["hidden"] else False)
                 page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE,
                                       graphics=fitz.PDF_REDACT_LINE_ART_NONE)
                 for unit, translated in placed:
@@ -224,7 +230,8 @@ class TranslateService:
                     # correctly, and shrinks the text if the translation is longer.
                     page.insert_htmlbox(
                         unit["rect"],
-                        _html_block(translated, unit["size"], is_rtl, unit["color"], unit["bold"]),
+                        _html_block(translated, unit["size"], is_rtl,
+                                    0 if unit["hidden"] else unit["color"], unit["bold"]),
                         rotate=unit["angle"], scale_low=0,
                     )
 
