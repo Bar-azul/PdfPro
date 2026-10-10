@@ -3,7 +3,10 @@ Rate limiting middleware using slowapi (Starlette/FastAPI wrapper for limits).
 """
 
 from fastapi import FastAPI, Request
-from slowapi import Limiter, _rate_limit_exceeded_handler
+import time
+
+from fastapi.responses import JSONResponse
+from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
@@ -41,4 +44,26 @@ limiter = Limiter(
 
 def setup_rate_limiter(app: FastAPI) -> None:
     app.state.limiter = limiter
-    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+    app.add_exception_handler(RateLimitExceeded, rate_limited)
+
+
+def rate_limited(request: Request, exc: RateLimitExceeded) -> JSONResponse:
+    """
+    429 with the seconds until this visitor's hourly quota resets, so the site
+    can show a countdown instead of a bare "try later". The value is in the
+    body (retry_after) as well as the Retry-After header, because a cross-site
+    page can read the body but not that header without extra CORS setup.
+    """
+    retry_after = 3600
+    try:
+        item, args = request.state.view_rate_limit
+        reset_at, _ = limiter.limiter.get_window_stats(item, *args)
+        retry_after = max(1, int(reset_at - time.time()) + 1)
+    except Exception:
+        pass
+    return JSONResponse(
+        status_code=429,
+        content={"code": "rate_limited", "retry_after": retry_after,
+                 "detail": "You've reached the hourly limit for this tool. Please try again later."},
+        headers={"Retry-After": str(retry_after)},
+    )
