@@ -60,6 +60,8 @@ class Settings(BaseSettings):
     GOOGLE_TRANSLATE_API_KEY: str = ""     # Cloud Translation API (v2) key
     CLOUDFLARE_ACCOUNT_ID: str = ""        # Workers AI (m2m100) — free daily allowance, no card
     CLOUDFLARE_API_TOKEN: str = ""
+    # Workers AI chat model used first for translation (empty = m2m100 only)
+    CLOUDFLARE_LLM_MODEL: str = "@cf/google/gemma-4-26b-a4b-it"
 
     @field_validator("UPLOAD_DIR", "OUTPUT_DIR", mode="before")
     @classmethod
