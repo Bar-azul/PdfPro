@@ -43,6 +43,7 @@ limiter = Limiter(
 
 
 def setup_rate_limiter(app: FastAPI) -> None:
+    """Attach the shared limiter to the app and answer 429s with the reset time."""
     app.state.limiter = limiter
     app.add_exception_handler(RateLimitExceeded, rate_limited)
 
