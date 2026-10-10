@@ -32,7 +32,7 @@ def _hex_to_rgb(hex_color: str) -> tuple:
 # ── Watermark ──────────────────────────────────────────────────────────────────
 
 @router.post("/watermark", response_model=FileResult, summary="Add text or image watermark")
-@limiter.limit("20/hour")
+@limiter.limit("100/hour")
 async def add_watermark(
     request: Request,
     file: UploadFile = File(..., description="PDF file"),
@@ -81,7 +81,7 @@ async def add_watermark(
 # ── Digital Signature ──────────────────────────────────────────────────────────
 
 @router.post("/sign", response_model=FileResult, summary="Add a digital signature")
-@limiter.limit("20/hour")
+@limiter.limit("100/hour")
 async def sign_pdf(
     request: Request,
     file: UploadFile = File(...),
@@ -179,7 +179,7 @@ async def sign_pdf(
 # ── Password Protection ────────────────────────────────────────────────────────
 
 @router.post("/protect", response_model=FileResult, summary="Password-protect a PDF")
-@limiter.limit("20/hour")
+@limiter.limit("100/hour")
 async def protect_pdf(
     request: Request,
     file: UploadFile = File(...),
@@ -207,7 +207,7 @@ async def protect_pdf(
 
 
 @router.post("/unlock", response_model=FileResult, summary="Remove PDF password")
-@limiter.limit("20/hour")
+@limiter.limit("100/hour")
 async def unlock_pdf(
     request: Request,
     file: UploadFile = File(...),
@@ -234,7 +234,7 @@ async def unlock_pdf(
 # ── Redact ─────────────────────────────────────────────────────────────────────
 
 @router.post("/redact", response_model=FileResult, summary="Black out sensitive text")
-@limiter.limit("20/hour")
+@limiter.limit("60/hour")
 async def redact_pdf(
     request: Request,
     file: UploadFile = File(...),

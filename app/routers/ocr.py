@@ -23,7 +23,7 @@ def _is_pro(user): return user is not None and user.get("plan") in ("pro", "ente
 
 
 @router.post("/extract", summary="Extract text from scanned PDF or image")
-@limiter.limit("10/hour")
+@limiter.limit("15/hour")
 async def ocr_extract(
     request: Request,
     file: UploadFile = File(..., description="PDF or image file"),

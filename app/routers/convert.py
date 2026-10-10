@@ -63,7 +63,7 @@ async def _run_conversion(
 # ════════════════════════════════════════════════════════════════════════════
 
 @router.post("/pdf-to-word", response_model=FileResult, summary="PDF → Word (.docx)")
-@limiter.limit("20/hour")
+@limiter.limit("30/hour")
 async def pdf_to_word(
     request: Request,
     file: UploadFile = File(..., description="PDF file to convert"),
@@ -83,7 +83,7 @@ async def pdf_to_word(
 
 
 @router.post("/pdf-to-excel", response_model=FileResult, summary="PDF → Excel (.xlsx)")
-@limiter.limit("20/hour")
+@limiter.limit("60/hour")
 async def pdf_to_excel(
     request: Request,
     file: UploadFile = File(...),
@@ -103,7 +103,7 @@ async def pdf_to_excel(
 
 
 @router.post("/pdf-to-pptx", response_model=FileResult, summary="PDF → PowerPoint (.pptx)")
-@limiter.limit("10/hour")
+@limiter.limit("30/hour")
 async def pdf_to_pptx(
     request: Request,
     file: UploadFile = File(...),
@@ -126,7 +126,7 @@ async def pdf_to_pptx(
 
 
 @router.post("/pdf-to-images", summary="PDF → Images (JPG / PNG)")
-@limiter.limit("20/hour")
+@limiter.limit("60/hour")
 async def pdf_to_images(
     request: Request,
     file: UploadFile = File(...),
@@ -164,7 +164,7 @@ async def pdf_to_images(
 
 
 @router.post("/pdf-to-text", summary="PDF → Plain text")
-@limiter.limit("30/hour")
+@limiter.limit("100/hour")
 async def pdf_to_text(
     request: Request,
     file: UploadFile = File(...),
@@ -184,7 +184,7 @@ async def pdf_to_text(
 # ════════════════════════════════════════════════════════════════════════════
 
 @router.post("/office-to-pdf", response_model=FileResult, summary="Word / Excel / PPT → PDF")
-@limiter.limit("20/hour")
+@limiter.limit("30/hour")
 async def office_to_pdf(
     request: Request,
     file: UploadFile = File(..., description="Word, Excel, or PowerPoint file"),
@@ -204,7 +204,7 @@ async def office_to_pdf(
 
 
 @router.post("/images-to-pdf", response_model=FileResult, summary="Images → PDF")
-@limiter.limit("20/hour")
+@limiter.limit("100/hour")
 async def images_to_pdf(
     request: Request,
     files: list[UploadFile] = File(..., description="One or more image files"),
@@ -236,7 +236,7 @@ async def images_to_pdf(
 # ── PDF info ──────────────────────────────────────────────────────────────────
 
 @router.post("/info", summary="Get PDF metadata and page info")
-@limiter.limit("60/hour")
+@limiter.limit("200/hour")
 async def pdf_info(
     request: Request,
     file: UploadFile = File(...),
