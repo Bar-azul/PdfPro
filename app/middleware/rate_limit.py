@@ -13,25 +13,42 @@ from slowapi.util import get_remote_address
 from ..config import settings
 
 
-def client_ip(request: Request) -> str:
-    """
-    The visitor's IP, not the proxy's. On Render every request arrives from an
-    internal 10.x proxy address, so keying limits on request.client.host made
-    all visitors behind the same proxy share one hourly quota. Proxies append
-    to X-Forwarded-For, so the right-most public address is the one Render's
-    edge saw; anything a client writes into the header itself sits to its left
-    and is ignored.
-    """
+def _global_ip(value: str | None):
     import ipaddress
-    forwarded = request.headers.get("x-forwarded-for", "")
-    for part in reversed([p.strip() for p in forwarded.split(",") if p.strip()]):
-        try:
-            ip = ipaddress.ip_address(part)
-        except ValueError:
-            continue
-        if ip.is_global:
-            return str(ip)
-    return get_remote_address(request)
+    try:
+        ip = ipaddress.ip_address((value or "").strip())
+    except ValueError:
+        return None
+    return str(ip) if ip.is_global else None
+
+
+def client_ip_source(request: Request) -> tuple[str, str]:
+    """
+    The visitor's IP and which header it came from.
+
+    Render sits behind Cloudflare, which sets CF-Connecting-IP / True-Client-IP
+    to the address that connected to it and overwrites any value the client
+    sent, so those come first. X-Forwarded-For is only a fallback: Render
+    appends to it, and with Cloudflare in front its right-most entry can be a
+    Cloudflare edge address that changes between requests (so a quota keyed on
+    it never fills up). The direct peer (an internal 10.x proxy on Render) is
+    the last resort.
+    """
+    for header in ("cf-connecting-ip", "true-client-ip"):
+        ip = _global_ip(request.headers.get(header))
+        if ip:
+            return ip, header
+    forwarded = [p.strip() for p in request.headers.get("x-forwarded-for", "").split(",") if p.strip()]
+    for part in reversed(forwarded):
+        ip = _global_ip(part)
+        if ip:
+            return ip, "x-forwarded-for"
+    return get_remote_address(request), "peer"
+
+
+def client_ip(request: Request) -> str:
+    """Rate-limit key: the visitor's IP (see client_ip_source)."""
+    return client_ip_source(request)[0]
 
 # Global limiter instance — imported by routers
 limiter = Limiter(

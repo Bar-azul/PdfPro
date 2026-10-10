@@ -7,7 +7,7 @@ Entry point for the PDF processing API.
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -70,6 +70,14 @@ async def progress_middleware(request, call_next):
     finally:
         if token is not None:
             _progress.end(token, ok)
+
+
+@app.get("/api/client-ip", tags=["Health"], include_in_schema=False)
+async def get_client_ip(request: Request):
+    """The address hourly limits are counted against, and where it came from (for checking the setup)."""
+    from .middleware.rate_limit import client_ip_source
+    ip, source = client_ip_source(request)
+    return {"ip": ip, "source": source}
 
 
 @app.get("/api/progress/{job_id}", tags=["Health"], include_in_schema=False)
