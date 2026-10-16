@@ -19,6 +19,7 @@ from PIL import Image
 from ..config import settings
 from . import progress
 from ..services.pdf_service import PDFService, _temp_pdf, _temp_file, _ms
+from .rtl_docx import fix_rtl_layout, fix_rtl_docx
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +63,14 @@ def _safe_unlink(path: Path) -> None:
 
 _RTL_RE = re.compile(r"[\u0590-\u08FF\uFB1D-\uFDFF\uFE70-\uFEFF]")
 _NUMBER_RE = re.compile(r"^(-)?\s*([\d,]*\d(?:\.\d+)?)\s*(-)?$")
+
+
+def _file_has_rtl(cv) -> bool:
+    """Whether the parsed PDF has any right-to-left text."""
+    try:
+        return any(_RTL_RE.search(p.get_text() or "") for p in cv.fitz_doc)
+    except Exception:
+        return False
 
 
 def _has_rtl(text: str) -> bool:
@@ -170,7 +179,21 @@ class ConvertService:
         if root.level > logging.INFO or root.level == logging.NOTSET:
             root.setLevel(logging.INFO)
         try:
-            cv.convert(str(out), start=0, end=None)
+            pd_settings = cv.default_settings
+            cv.parse(start=0, end=None, **pd_settings)
+            # Hebrew/Arabic: put mixed-direction lines in reading order and mark the
+            # paragraphs right to left (pdf2docx lays everything out left to right)
+            try:
+                rows = fix_rtl_layout(cv)
+            except Exception as e:
+                rows = 0
+                logger.warning(f"RTL layout fix skipped: {e}")
+            cv.make_docx(str(out), **pd_settings)
+            if rows or _file_has_rtl(cv):
+                try:
+                    fix_rtl_docx(out)
+                except Exception as e:
+                    logger.warning(f"RTL docx fix skipped: {e}")
         finally:
             root.removeHandler(handler)
             root.setLevel(old_level)
