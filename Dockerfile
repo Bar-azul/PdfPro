@@ -10,6 +10,8 @@ RUN apt-get update && apt-get install -y \
     tesseract-ocr-eng \
     # LibreOffice (for Office → PDF)
     libreoffice \
+    # ffmpeg (audio for the transcription tool)
+    ffmpeg \
     # Fonts with Hebrew/Arabic glyphs (OCR text layer, Office → PDF)
     fonts-dejavu-core \
     culmus \
