@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from .routers import convert, organize, edit, ocr, translate, auth
+from .routers import convert, organize, edit, ocr, translate, transcribe, auth
 from .services.storage_service import StorageService
 from .middleware.rate_limit import setup_rate_limiter
 from .config import settings
@@ -98,6 +98,7 @@ app.include_router(organize.router,  prefix="/api/organize",  tags=["Organize"])
 app.include_router(edit.router,      prefix="/api/edit",      tags=["Edit"])
 app.include_router(ocr.router,       prefix="/api/ocr",       tags=["OCR"])
 app.include_router(translate.router, prefix="/api/translate", tags=["Translate"])
+app.include_router(transcribe.router, prefix="/api/transcribe", tags=["Transcribe"])
 
 # ── Static output files ───────────────────────────────────────────────────────
 app.mount("/files", StaticFiles(directory=settings.OUTPUT_DIR), name="files")

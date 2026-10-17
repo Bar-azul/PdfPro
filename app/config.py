@@ -62,6 +62,8 @@ class Settings(BaseSettings):
     CLOUDFLARE_API_TOKEN: str = ""
     # Workers AI chat model used first for translation (empty = m2m100 only)
     CLOUDFLARE_LLM_MODEL: str = "@cf/google/gemma-4-26b-a4b-it"
+    # Workers AI speech-to-text model for the transcription tool
+    CLOUDFLARE_WHISPER_MODEL: str = "@cf/openai/whisper-large-v3-turbo"
 
     @field_validator("UPLOAD_DIR", "OUTPUT_DIR", mode="before")
     @classmethod
