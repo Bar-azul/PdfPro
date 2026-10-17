@@ -27,3 +27,13 @@ ENCRYPTED_PDF = (
 def api_error(status_code: int, pair: tuple[str, str]) -> ApiError:
     code, detail = pair
     return ApiError(status_code, code, detail)
+
+
+def is_daily_quota(status: int, body: str) -> bool:
+    """Cloudflare Workers AI: the account's free daily neuron allowance is used up (code 3036)."""
+    return status == 429 and ("3036" in body or "daily free allocation" in body.lower())
+
+
+def daily_quota_error() -> ApiError:
+    return ApiError(503, "daily_quota",
+                    "Today's free allowance for this tool has been used up. Please try again tomorrow.")

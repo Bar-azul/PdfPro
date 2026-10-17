@@ -25,7 +25,7 @@ import httpx
 from ..config import settings
 from . import progress
 from ..services.pdf_service import _temp_file, _ms
-from ..utils.errors import ApiError
+from ..utils.errors import ApiError, daily_quota_error, is_daily_quota
 
 logger = logging.getLogger(__name__)
 
@@ -141,6 +141,9 @@ class TranscribeService:
                     res = r.json().get("result") or {}
                     break
                 last = f"HTTP {r.status_code}: {r.text[:200]}"
+                if is_daily_quota(r.status_code, r.text):
+                    logger.warning(f"Workers AI daily allowance used up: {last}")
+                    raise daily_quota_error()
                 if r.status_code < 500 and r.status_code != 429:
                     break
                 time.sleep(2 * (attempt + 1))

@@ -20,7 +20,7 @@ from deep_translator import GoogleTranslator
 from ..config import settings
 from . import progress
 from ..services.pdf_service import _temp_pdf, _ms
-from ..utils.errors import ApiError
+from ..utils.errors import ApiError, daily_quota_error, is_daily_quota
 
 logger = logging.getLogger(__name__)
 
@@ -201,6 +201,8 @@ class TranslateService:
                            "This PDF has no selectable text to translate. If it is a scan, run OCR first.")
         if stats["failed"] == stats["tried"]:
             out.unlink(missing_ok=True)
+            if translator.quota_exhausted:
+                raise daily_quota_error()
             logger.error(f"Translation failed for every block; last error: {translator.last_error}")
             raise ApiError(502, "translate_failed",
                            "The translation service is not responding right now. Please try again in a few minutes.")
@@ -384,6 +386,7 @@ class _Translator:
         self.source = source or "auto"
         self.target = target
         self.last_error: str | None = None
+        self.quota_exhausted = False  # Workers AI free daily allowance used up
         self._client = httpx.Client(timeout=20, headers={"User-Agent": "Mozilla/5.0"})
         self._fallback = None
         self._latin_lang: str | None = None
@@ -538,6 +541,8 @@ class _Translator:
             except Exception as e:
                 self._record(name, False)
                 self.last_error = f"{name}: {e}"
+                if "HTTP 429" in str(e) and is_daily_quota(429, str(e)):
+                    self.quota_exhausted = True
                 logger.warning(f"Translation failed via {name}: {e}")
         return None
 
