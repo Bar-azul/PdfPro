@@ -17,6 +17,14 @@ Two passes fix it:
   and rebuilds the row as one line whose spans follow that order. Each
   character keeps the span (font, size, colour, bold) it came from.
 
+  The same pass also: restores word spaces that some PDF producers (Chrome's
+  "Save as PDF") leave out and pdf2docx drops; keeps list bullets drawn as images
+  in place; rejoins a line that pdf2docx split into two blocks or two fake
+  columns; and joins the wrapped lines of a right-to-left paragraph back into
+  one paragraph (pdf2docx makes each line its own paragraph). Rows that mix
+  Hebrew and English take the document's main direction, unless the line
+  clearly hugs the left or right side of its column.
+
 * fix_rtl_docx() edits the finished .docx: paragraphs with RTL letters get
   <w:bidi/> (right-to-left paragraph) and runs get <w:rtl/> plus complex-script
   font, size, bold and italic copied from their Latin settings.
@@ -35,7 +43,7 @@ _RTL = re.compile(r"[֐-׿؀-ۿݐ-ݿיִ-﷿ﹰ-﻿]")
 
 # ── visual → logical ──────────────────────────────────────────────────────────
 
-def _visual_to_logical_order(text: str) -> list[int]:
+def _visual_to_logical_order(text: str, base: str = "R") -> list[int]:
     """
     Indexes of `text` (characters in left-to-right page order) in reading order.
 
@@ -49,8 +57,8 @@ def _visual_to_logical_order(text: str) -> list[int]:
                                 resolve_weak_types, resolve_neutral_types, resolve_implicit_levels,
                                 reorder_resolved_levels, PARAGRAPH_LEVELS)
     storage = get_empty_storage()
-    storage["base_level"] = PARAGRAPH_LEVELS["R"]
-    storage["base_dir"] = "R"
+    storage["base_level"] = PARAGRAPH_LEVELS[base]
+    storage["base_dir"] = base
     get_embedding_levels(text, storage, False, False)
     for i, ch in enumerate(storage["chars"]):
         ch["_i"] = i
@@ -62,7 +70,23 @@ def _visual_to_logical_order(text: str) -> list[int]:
     return [ch["_i"] for ch in storage["chars"]]
 
 
-_NO_SPACE_NEXT_TO = set(".,:;!?")  # glyph gaps next to punctuation are kerning, not spaces
+_LATIN = re.compile(r"[A-Za-z]")
+_OBJ = "\ufffc"  # stands in for an inline image (list bullets are often drawn as images)
+
+
+class _Placeholder:
+    """A non-text item in a row (an image span) with a position, ordered like a character."""
+    def __init__(self, bbox):
+        self.c = _OBJ
+        self.bbox = bbox
+
+
+def rtl_majority(text: str) -> bool:
+    """More Hebrew/Arabic letters than Latin ones: a right-to-left paragraph."""
+    return len(_RTL.findall(text)) >= len(_LATIN.findall(text))
+
+
+_NO_SPACE_NEXT_TO = set(".,:;!?()[]{}")  # glyph gaps next to punctuation are kerning, not spaces
 _SWAP_CHARS = "()[]{}"
 _SWAP = str.maketrans("()[]{}", ")(][}{")
 
@@ -99,17 +123,21 @@ def _rows(lines: list) -> list[list]:
     return rows
 
 
-def _fix_row(row: list) -> bool:
+def _fix_row(row: list, base_hint: str = "R", col: tuple | None = None) -> bool:
     """Rebuild one row in reading order. False when the row is left as it is."""
     from pdf2docx.text.TextSpan import TextSpan
+    from pdf2docx.image.ImageSpan import ImageSpan
 
     items = []  # (x0, x1, char, span)
     for line in row:
         if not line.is_horizontal_text:
             return False
         for span in line.spans:
+            if isinstance(span, ImageSpan):  # e.g. a list bullet drawn as an image
+                items.append((span.bbox[0], span.bbox[2], _Placeholder(tuple(span.bbox)), span))
+                continue
             if not isinstance(span, TextSpan) or not span.chars:
-                return False  # images or text without positions: leave the row alone
+                return False  # text without positions: leave the row alone
             for ch in span.chars:
                 if len(ch.c) == 1:
                     items.append((ch.bbox[0], ch.bbox[2], ch, span))
@@ -121,8 +149,20 @@ def _fix_row(row: list) -> bool:
                         x = ch.bbox[0] + k * w
                         items.append((x, x + w, part, span))
     text = "".join(c.c for _, _, c, _ in items)
-    if not items or not _RTL.search(text):
+    if not items:
         return False
+    has_rtl = bool(_RTL.search(text))
+    # Paragraph direction: the document's main direction, unless the row clearly
+    # hugs one side of its column (a short right-aligned or left-aligned line).
+    base = base_hint
+    if col:
+        x0 = min(t[0] for t in items); x1 = max(t[1] for t in items)
+        w = max(col[1] - col[0], 1)
+        left_gap, right_gap = x0 - col[0], col[1] - x1
+        if right_gap < 0.05 * w and left_gap > 0.15 * w:
+            base = "R"
+        elif left_gap < 0.05 * w and right_gap > 0.15 * w:
+            base = "L"
 
     items.sort(key=lambda t: (t[0] + t[1]) / 2)
     # a gap between pieces with no space character in it: add one
@@ -133,6 +173,7 @@ def _fix_row(row: list) -> bool:
     for x0, x1, ch, span in items:
         if (prev_x1 is not None and x0 - prev_x1 > 0.2 * size
                 and ch.c != " " and visual and visual[-1][0].c != " "
+                and not isinstance(ch, _Placeholder) and not isinstance(visual[-1][0], _Placeholder)
                 and ch.c not in _NO_SPACE_NEXT_TO and visual[-1][0].c not in _NO_SPACE_NEXT_TO):
             space = copy.copy(ch)
             space.c = " "
@@ -140,11 +181,16 @@ def _fix_row(row: list) -> bool:
         visual.append((ch, span))
         prev_x1 = x1
 
+    added = len(visual) - len(items)
+    if not has_rtl and not added:
+        return False  # left-to-right row with its spaces: nothing to do
     # a "character" can hold more than one code point (ligatures, marks): order by
     # code point, then map each back to its item, keeping each item once
     owner = [k for k, (c, _) in enumerate(visual) for _ in c.c]
     seen, logical = set(), []
-    for i in _visual_to_logical_order("".join(c.c for c, _ in visual)):
+    order = (_visual_to_logical_order("".join(c.c for c, _ in visual), base) if has_rtl
+             else range(len(owner)))
+    for i in order:
         k = owner[i]
         if k not in seen:
             seen.add(k)
@@ -170,14 +216,25 @@ def _fix_row(row: list) -> bool:
         if ch.c == " " and (not collapsed or collapsed[-1][0].c == " "):
             continue
         collapsed.append((ch, span))
+    # lines of a wrapped paragraph are joined without a separator: end each row with a space
+    if collapsed and collapsed[-1][0].c not in (" ", "-", "\u2013", _OBJ) and not isinstance(collapsed[-1][0], _Placeholder):
+        sp = copy.copy(next(c for c, _ in reversed(collapsed) if not isinstance(c, _Placeholder)))
+        sp.c = " "
+        collapsed.append((sp, collapsed[-1][1]))
     new_spans = []
     for ch, span in collapsed:
-        if new_spans and new_spans[-1][0] is span:
+        if isinstance(ch, _Placeholder):
+            new_spans.append((span, None))  # the image span itself, unchanged
+            continue
+        if new_spans and new_spans[-1][0] is span and new_spans[-1][1] is not None:
             new_spans[-1][1].append(ch)
         else:
             new_spans.append((span, [ch]))
     rebuilt = []
     for span, chars in new_spans:
+        if chars is None:
+            rebuilt.append(span)
+            continue
         s = copy.copy(span)
         s.chars = chars
         rebuilt.append(s)
@@ -194,23 +251,139 @@ def _fix_row(row: list) -> bool:
     return True
 
 
+def _block_text(blk) -> str:
+    return "".join(getattr(s, "text", "") or "" for l in blk.lines for s in l.spans)
+
+
+def _join_same_row(blocks: list) -> list:
+    """
+    pdf2docx sometimes splits one visual line of right-to-left text into two
+    blocks side by side (e.g. at a number or an English word). Put such pieces
+    back into one block so the row can be reordered as a whole.
+    """
+    from pdf2docx.text.TextBlock import TextBlock
+    out = []
+    for blk in blocks:
+        prev = out[-1] if out else None
+        if (isinstance(blk, TextBlock) and isinstance(prev, TextBlock) and blk.lines and prev.lines
+                and _RTL.search(_block_text(prev) + _block_text(blk))):
+            y0, y1 = max(prev.bbox[1], blk.bbox[1]), min(prev.bbox[3], blk.bbox[3])
+            h = min(prev.bbox[3] - prev.bbox[1], blk.bbox[3] - blk.bbox[1])
+            gap = max(blk.bbox[0] - prev.bbox[2], prev.bbox[0] - blk.bbox[2])
+            same_row = h > 0 and (y1 - y0) > 0.6 * h and len(_rows(list(prev.lines))) == 1 \
+                and len(_rows(list(blk.lines))) == 1
+            if same_row and gap < 2 * h:
+                prev.lines.extend(list(blk.lines))
+                prev.update_bbox((min(prev.bbox[0], blk.bbox[0]), min(prev.bbox[1], blk.bbox[1]),
+                                  max(prev.bbox[2], blk.bbox[2]), max(prev.bbox[3], blk.bbox[3])))
+                continue
+        out.append(blk)
+    return out
+
+
+def _false_columns(section) -> bool:
+    """
+    pdf2docx splits a page into columns where it sees a vertical gap. In right-to-left
+    text it often cuts a single line in two (e.g. after a number), giving two
+    "columns" whose blocks sit on the same rows, side by side. Real columns have
+    a wide gutter; these touch.
+    """
+    from pdf2docx.text.TextBlock import TextBlock
+    cols = list(section)
+    for a, b in zip(cols, cols[1:]):
+        for x in a.blocks:
+            for y in b.blocks:
+                if not (isinstance(x, TextBlock) and isinstance(y, TextBlock)):
+                    continue
+                h = min(x.bbox[3] - x.bbox[1], y.bbox[3] - y.bbox[1])
+                overlap = min(x.bbox[3], y.bbox[3]) - max(x.bbox[1], y.bbox[1])
+                gap = max(y.bbox[0] - x.bbox[2], x.bbox[0] - y.bbox[2])
+                if h > 0 and overlap > 0.6 * h and gap < 0.3 * h:
+                    return True
+    return False
+
+
+def _merge_wrapped(blocks: list, col_left: float, col_right: float) -> list:
+    """
+    pdf2docx often turns each line of a right-to-left paragraph into its own block
+    (it expects lines to share a left edge), so Word gets one paragraph per line.
+    Join a block into the previous one when the previous line is full (reaches the
+    column's left side, i.e. it wrapped), both are right-to-left, share a right
+    edge, follow each other closely and use the same text size.
+    """
+    from pdf2docx.text.TextBlock import TextBlock
+    out = []
+    width = max(col_right - col_left, 1)
+    for blk in blocks:
+        prev = out[-1] if out else None
+        if (isinstance(blk, TextBlock) and isinstance(prev, TextBlock) and prev.lines and blk.lines
+                and rtl_majority(_block_text(prev)) and _RTL.search(_block_text(prev))
+                and rtl_majority(_block_text(blk)) and _RTL.search(_block_text(blk))):
+            last = prev.lines[-1]
+            h = max(last.bbox[3] - last.bbox[1], 1)
+            gap = blk.bbox[1] - prev.bbox[3]
+            sizes = lambda b: [s.size for l in b.lines for s in l.spans if getattr(s, "size", 0)]
+            sp, sb = sizes(prev), sizes(blk)
+            same_size = sp and sb and abs(max(sp) - max(sb)) <= 0.15 * max(sp)
+            if (abs(prev.bbox[2] - blk.bbox[2]) <= 3 and -0.5 * h <= gap <= 0.6 * h and same_size
+                    and last.bbox[0] - col_left <= 0.12 * width):
+                for line in prev.lines:
+                    line.line_break = 0
+                prev.lines.extend(list(blk.lines))
+                prev.update_bbox((min(prev.bbox[0], blk.bbox[0]), prev.bbox[1],
+                                  max(prev.bbox[2], blk.bbox[2]), blk.bbox[3]))
+                prev.after_space = getattr(blk, "after_space", prev.after_space)
+                from pdf2docx.common.share import TextAlignment
+                prev.alignment = TextAlignment.JUSTIFY
+                prev.first_line_space = 0
+                continue
+        out.append(blk)
+    return out
+
+
 def fix_rtl_layout(converter) -> int:
-    """Put RTL rows of every parsed page in reading order. Returns rows changed."""
+    """Put RTL rows of every parsed page in reading order, restore missing word
+    spaces and rejoin wrapped right-to-left paragraphs. Returns rows changed."""
     from pdf2docx.text.TextBlock import TextBlock
     changed = 0
 
-    def walk_blocks(blocks):
+    # the document's main direction decides rows that mix Hebrew and English
+    all_text = []
+    for page in converter.pages:
+        for section in getattr(page, "sections", []):
+            for column in section:
+                for blk in column.blocks:
+                    if isinstance(blk, TextBlock):
+                        all_text.append(_block_text(blk))
+    joined = "".join(all_text)
+    doc_base = "R" if _RTL.search(joined) and rtl_majority(joined) else "L"
+
+    if doc_base == "R":
+        for page in converter.pages:
+            for section in getattr(page, "sections", []):
+                try:
+                    if len(section) > 1 and _false_columns(section):
+                        cols = list(section)
+                        first = cols[0]
+                        blocks = [blk for c in cols for blk in c.blocks]
+                        blocks.sort(key=lambda b: (round(b.bbox[1]), -b.bbox[2]))
+                        first.blocks.reset(blocks)
+                        x0 = min(c.bbox[0] for c in cols); x1 = max(c.bbox[2] for c in cols)
+                        first.update_bbox((x0, first.bbox[1], x1, max(c.bbox[3] for c in cols)))
+                        section.reset([first])
+                except Exception as e:
+                    logger.debug(f"column merge skipped: {e}")
+
+    def walk_blocks(blocks, col=None):
         nonlocal changed
         for blk in blocks:
             if isinstance(blk, TextBlock):
                 lines = list(blk.lines)
-                if not _RTL.search("".join(getattr(s, "text", "") or "" for l in lines for s in l.spans)):
-                    continue
                 for row in _rows(lines):
                     try:
-                        changed += _fix_row(row)
+                        changed += _fix_row(row, doc_base, col)
                     except Exception as e:  # never fail the conversion over one row
-                        logger.debug(f"RTL row left as is: {e}")
+                        logger.debug(f"row left as is: {e}")
                 blk.lines.reset([l for l in lines if len(l.spans)])
             elif getattr(blk, "is_table_block", False):  # tables: cells hold their own blocks
                 for row in blk:
@@ -224,7 +397,26 @@ def fix_rtl_layout(converter) -> int:
             continue
         for section in page.sections:
             for column in section:
-                walk_blocks(column.blocks)
+                try:
+                    joined_blocks = _join_same_row(list(column.blocks))
+                    if len(joined_blocks) != len(column.blocks):
+                        column.blocks.reset(joined_blocks)
+                except Exception as e:
+                    logger.debug(f"row join skipped: {e}")
+                tb = [b for b in column.blocks if isinstance(b, TextBlock) and b.lines]
+                col = (min(b.bbox[0] for b in tb), max(b.bbox[2] for b in tb)) if len(tb) > 1 else None
+                walk_blocks(column.blocks, col)
+                blocks = list(column.blocks)
+                text_blocks = [b for b in blocks if isinstance(b, TextBlock) and b.lines]
+                if len(text_blocks) > 1:
+                    left = min(b.bbox[0] for b in text_blocks)
+                    right = max(b.bbox[2] for b in text_blocks)
+                    try:
+                        merged = _merge_wrapped(blocks, left, right)
+                        if len(merged) != len(blocks):
+                            column.blocks.reset(merged)
+                    except Exception as e:
+                        logger.debug(f"paragraph merge skipped: {e}")
     return changed
 
 
@@ -257,7 +449,8 @@ def fix_rtl_docx(path: Path) -> int:
         if not _RTL.search(p.text or ""):
             continue
         pPr = p._p.get_or_add_pPr()
-        if first_child(pPr, "w:bidi") is None:
+        rtl_para = rtl_majority(p.text or "")  # an English paragraph quoting Hebrew stays LTR
+        if rtl_para and first_child(pPr, "w:bidi") is None:
             bidi = OxmlElement("w:bidi")
             # w:bidi must come before w:spacing / w:ind / w:jc in pPr
             anchor = None
@@ -274,10 +467,10 @@ def fix_rtl_docx(path: Path) -> int:
         # In a right-to-left paragraph Word reads jc left/right as start/end, so
         # pdf2docx's "right" (the page's right edge) is "left" here, and vice versa.
         jc = first_child(pPr, "w:jc")
-        if jc is not None and jc.get(qn("w:val")) in ("left", "right"):
+        if rtl_para and jc is not None and jc.get(qn("w:val")) in ("left", "right"):
             jc.set(qn("w:val"), "left" if jc.get(qn("w:val")) == "right" else "right")
         ind = first_child(pPr, "w:ind")
-        if ind is not None:  # indents are start/end too
+        if rtl_para and ind is not None:  # indents are start/end too
             left, right = ind.get(qn("w:left")), ind.get(qn("w:right"))
             if left is not None or right is not None:
                 ind.set(qn("w:left"), right or "0")
