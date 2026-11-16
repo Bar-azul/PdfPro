@@ -524,7 +524,7 @@ class OCRService:
 
     @staticmethod
     def extract_to_docx(
-        pdf_path: Path, language: str = "heb+eng", dpi: int = 200
+        pdf_path: Path, language: str = "heb+eng", dpi: int = 200, join_lines: bool = False
     ) -> Path:
         """OCR to a Word file: one paragraph per line, RTL paragraphs for Hebrew/Arabic, a page break per page."""
         from docx import Document
@@ -564,7 +564,11 @@ class OCRService:
             if len(results) > 1:
                 add_par(f"— {r['page']} —", size=10, bold=True)
             for block in [b for b in r["text"].split("\n\n") if b.strip()]:
-                lines = block.split("\n")
+                lines = [ln.strip() for ln in block.split("\n") if ln.strip()]
+                if join_lines:  # one editable paragraph per block, not one per printed line
+                    para = add_par(" ".join(lines))
+                    para.paragraph_format.space_after = Pt(8)
+                    continue
                 for k, line in enumerate(lines):
                     para = add_par(line)
                     para.paragraph_format.space_after = Pt(8 if k == len(lines) - 1 else 0)

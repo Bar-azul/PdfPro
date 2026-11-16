@@ -65,6 +65,27 @@ _RTL_RE = re.compile(r"[\u0590-\u08FF\uFB1D-\uFDFF\uFE70-\uFEFF]")
 _NUMBER_RE = re.compile(r"^(-)?\s*([\d,]*\d(?:\.\d+)?)\s*(-)?$")
 
 
+SCAN_TO_WORD_MAX_PAGES = 30
+
+
+def _is_scanned(pdf_path: Path) -> bool:
+    """At least half the pages are pictures with no real (visible) text on them."""
+    from .ocr_service import _needs_ocr
+    try:
+        with fitz.open(pdf_path) as doc:
+            if doc.page_count == 0:
+                return False
+            scanned = 0
+            for page in doc:
+                area = abs(page.rect)
+                covered = sum(abs(fitz.Rect(i["bbox"]) & page.rect) for i in page.get_image_info())
+                if area and covered / area >= 0.5 and _needs_ocr(page):
+                    scanned += 1
+            return scanned * 2 >= doc.page_count
+    except Exception:
+        return False
+
+
 def _file_has_rtl(cv) -> bool:
     """Whether the parsed PDF has any right-to-left text."""
     try:
@@ -170,6 +191,23 @@ class ConvertService:
         from pdf2docx import Converter
         t0 = time.time()
         pdf_path = Path(pdf_path).resolve()
+
+        # A scan (pages that are pictures, maybe with an invisible OCR layer) gives
+        # pdf2docx nothing to work with: the .docx would hold page images, not text.
+        # Read such files with OCR and build the document from the recognised text.
+        if _is_scanned(pdf_path):
+            from .ocr_service import OCRService
+            from ..utils.errors import ApiError
+            with fitz.open(pdf_path) as d:
+                pages = d.page_count
+            if pages > SCAN_TO_WORD_MAX_PAGES:
+                raise ApiError(400, "scan_too_long",
+                               f"This is a scanned document with {pages} pages. Scanned files can be "
+                               f"converted up to {SCAN_TO_WORD_MAX_PAGES} pages at a time: split it first.")
+            out = OCRService.extract_to_docx(pdf_path, language="heb+eng", join_lines=True)
+            logger.info(f"PDF→Word (scan, OCR) {pages} pages in {_ms(t0)}ms")
+            return out
+
         out = _temp_file("converted", ".docx")
         cv = Converter(str(pdf_path))
         handler = _Pdf2DocxProgress()
