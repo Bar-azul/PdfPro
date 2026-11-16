@@ -180,6 +180,11 @@ class ConvertService:
             root.setLevel(logging.INFO)
         try:
             pd_settings = cv.default_settings
+            has_rtl = _file_has_rtl(cv)
+            if has_rtl:
+                # borderless ("stream") tables are guessed from aligned text, and right-to-left
+                # pieces of one line look aligned: slides and bullet lists turn into tables
+                pd_settings = dict(pd_settings, parse_stream_table=False)
             cv.parse(start=0, end=None, **pd_settings)
             # Hebrew/Arabic: put mixed-direction lines in reading order and mark the
             # paragraphs right to left (pdf2docx lays everything out left to right)
@@ -189,7 +194,7 @@ class ConvertService:
                 rows = 0
                 logger.warning(f"RTL layout fix skipped: {e}")
             cv.make_docx(str(out), **pd_settings)
-            if rows or _file_has_rtl(cv):
+            if rows or has_rtl:
                 try:
                     fix_rtl_docx(out)
                 except Exception as e:
