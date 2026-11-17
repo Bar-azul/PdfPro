@@ -11,6 +11,7 @@ import json
 import logging
 import re
 import time
+import unicodedata
 from pathlib import Path
 
 import fitz
@@ -65,57 +66,308 @@ _LATIN_GROUP = re.compile(r"\(([^()\u0590-\u05FF\u0600-\u06FF]*)\)")
 _PUA = re.compile(r"[\uE000-\uF8FF]")
 
 
+_BULLETS = set("•◦▪▫●○■□‣⁃∙➢➤►▶✓✔")
+_NUMBERED = re.compile(r"^(\d{1,2}|[a-zA-Zא-ת])[.)]\s")
+_MARKER_ONLY = re.compile(r"^[\s.)(\d" + "".join(sorted(_BULLETS)) + r"]{1,4}$")
+_CELL_GAP = 1.5     # a horizontal gap wider than this many font sizes separates two cells
+_SPACE_GAP = 0.22   # a gap wider than this (with no space character in it) is a word space
+
+
+def _line_pieces(page: "fitz.Page", block: dict, erase_icons: bool, page_rtl: bool = False) -> list[dict]:
+    """
+    The horizontal text of one block as pieces: one per table cell / text run on a row.
+
+    MuPDF's lines do not follow the page's cells. In a Hebrew table it put a course
+    name and the credits column in one line ("מבוא לכלכלה4"), and it split one
+    sentence into three lines at each change of direction. Translated line by line,
+    cells ended up in each other's columns and the sentence came out scrambled.
+    So the characters are regrouped: lines that share a row are pooled, the row is
+    cut wherever there is a cell-sized gap, and each piece is read in logical order
+    (right-to-left runs reversed back, numbers and English kept).
+    """
+    from .rtl_docx import _visual_to_logical_order, rtl_majority
+
+    lines = []
+    for line in block["lines"]:
+        if tuple(round(v) for v in line["dir"]) != (1, 0):
+            continue
+        # clusters: a letter with its combining marks (Thai vowels and tones, Hebrew
+        # points). Marks sit above the letter and sorting them by position on their
+        # own scrambled Thai words.
+        chars = []
+        for k, sp in enumerate(line["spans"]):
+            for ch in sp["chars"]:
+                c = ch["c"]
+                if chars and unicodedata.category(c) in ("Mn", "Me"):
+                    chars[-1]["s"] += c
+                    chars[-1]["bbox"] |= fitz.Rect(ch["bbox"])
+                    continue
+                chars.append({"c": c, "s": c, "bbox": fitz.Rect(ch["bbox"]), "size": sp["size"],
+                              "span": (id(line), k),
+                              "base": ch["origin"][1], "color": sp.get("color", 0),
+                              "flags": sp.get("flags", 0), "alpha": sp.get("alpha", 255)})
+        ink = [c for c in chars if c["c"].strip()]
+        if ink:
+            bases = sorted(c["base"] for c in ink)
+            lines.append({"bbox": fitz.Rect(line["bbox"]), "chars": chars, "base": bases[len(bases) // 2],
+                          "size": max(c["size"] for c in ink)})
+
+    # rows: lines on the same baseline (line boxes can be much taller than the text
+    # and overlap the next line, so the boxes themselves are not a reliable test)
+    rows = []
+    for ln in sorted(lines, key=lambda l: l["base"]):
+        for row in rows:
+            if abs(ln["base"] - row["base"]) < 0.4 * min(ln["size"], row["size"]):
+                row["lines"].append(ln)
+                break
+        else:
+            rows.append({"base": ln["base"], "size": ln["size"], "lines": [ln]})
+
+    pieces = []
+    for row in rows:
+        chars = sorted((c for ln in row["lines"] for c in ln["chars"]), key=lambda c: c["bbox"].x0)
+        y0 = min(ln["bbox"].y0 for ln in row["lines"])
+        y1 = max(ln["bbox"].y1 for ln in row["lines"])
+        groups, cur, last = [], [], None
+        for c in chars:
+            ink = c["c"].strip() and not _PUA.match(c["c"])
+            bullet = c["c"] in _BULLETS
+            if cur and (bullet or (last is not None and last["c"] in _BULLETS) or
+                        (ink and last is not None and c["bbox"].x0 - last["bbox"].x1 > _CELL_GAP * c["size"])):
+                # a list bullet is a piece of its own: it is not translated and stays put
+                groups.append(cur)
+                cur = []
+            cur.append(c)
+            if ink:
+                last = c
+        groups.append(cur)
+        row_pieces = []
+        for g in groups:
+            ink = [c for c in g if c["c"].strip() and not _PUA.match(c["c"])]
+            if not ink:
+                continue
+            seq, prev = [], None
+            for c in g:
+                if _PUA.match(c["c"]):
+                    continue
+                if (prev is not None and c["c"] != " " and prev["c"] != " "
+                        and c["bbox"].x0 - prev["bbox"].x1 > _SPACE_GAP * c["size"]):
+                    seq.append((" ", " "))
+                if not (c["c"] == " " and seq and seq[-1][0] == " "):
+                    seq.append((c["c"], c["s"]))
+                prev = c
+            visual = "".join(b for b, _ in seq)
+            if _RTL_TEXT.search(visual):
+                # paragraph direction: the piece's own majority, or the page's when the
+                # piece is mostly English inside a Hebrew page ("צד שרת (Python + FastAPI)")
+                base = "R" if rtl_majority(visual) or page_rtl else "L"
+                order = _visual_to_logical_order(visual, base)
+                text = "".join(seq[i][1] for i in order)
+            else:
+                text = "".join(full for _, full in seq)
+            text = re.sub(r"\s+", " ", text).strip()
+            # one vote per text run, not per character: a heading with small Thai and
+            # large English letters keeps the heading size
+            runs = {}
+            for c in ink:
+                runs.setdefault(c["span"], c["size"])
+            sizes = sorted(runs.values())
+            box = fitz.Rect(ink[0]["bbox"])
+            for c in ink[1:]:
+                box |= c["bbox"]
+            erase = fitz.Rect(box)
+            if erase_icons:
+                for c in g:
+                    erase |= c["bbox"]
+            first = ink[0] if not _RTL_TEXT.search(text) else ink[-1]
+            row_pieces.append({
+                "text": text, "size": sizes[len(sizes) // 2],
+                "x0": box.x0, "x1": box.x1, "y0": y0, "y1": y1,
+                "redact": [fitz.Rect(erase.x0, y0, erase.x1, y1)],
+                "color": first["color"], "bold": bool(first["flags"] & 16),
+                "hidden": all(c["alpha"] == 0 for c in ink),
+            })
+        # alone on its row (a bullet or list number next to it doesn't count)
+        texts = [pc for pc in row_pieces if not _MARKER_ONLY.match(pc["text"])]
+        for pc in row_pieces:
+            pc["alone"] = len(texts) <= 1
+        pieces += row_pieces
+    pieces.sort(key=lambda pc: (pc["y0"], pc["x0"]))
+    return pieces
+
+
+def _list_marks(page: "fitz.Page", blocks: list[dict]) -> list["fitz.Rect"]:
+    """List bullets on the page: bullet glyphs and small drawn dots/squares."""
+    marks = []
+    for b in blocks:
+        for line in b.get("lines", []):
+            for sp in line["spans"]:
+                for ch in sp["chars"]:
+                    if ch["c"] in _BULLETS:
+                        marks.append(fitz.Rect(ch["bbox"]))
+    try:
+        for d in page.get_drawings():
+            r = d["rect"]
+            if 1 < r.width <= 10 and 1 < r.height <= 10 and 0.5 <= r.width / r.height <= 2:
+                marks.append(fitz.Rect(r))
+    except Exception:
+        pass
+    return marks
+
+
+def _vertical_edges(page: "fitz.Page") -> list[tuple[float, float, float]]:
+    """Vertical lines drawn on the page (table borders) as (x, y0, y1)."""
+    edges = []
+    try:
+        drawings = page.get_drawings()
+    except Exception:
+        return edges
+    for d in drawings:
+        for item in d.get("items", []):
+            if item[0] == "l":
+                a, b = item[1], item[2]
+                if abs(a.x - b.x) < 1 and abs(a.y - b.y) > 4:
+                    edges.append(((a.x + b.x) / 2, min(a.y, b.y), max(a.y, b.y)))
+            elif item[0] == "re":
+                r = item[1]
+                if r.width < 2 and r.height > 4:      # a thin filled bar drawn as a line
+                    edges.append(((r.x0 + r.x1) / 2, r.y0, r.y1))
+                elif r.height > 4 and d.get("color") is not None:   # a stroked cell
+                    edges += [(r.x0, r.y0, r.y1), (r.x1, r.y0, r.y1)]
+    return edges
+
+
 def _text_units(page: "fitz.Page", erase_icons: bool = False) -> list[dict]:
     """
-    The pieces of a page to translate, one per line — except lines that wrap
-    into the next one (same size, near the full block width), which are joined
-    into one sentence. Translating whole MuPDF blocks sent entire menu columns
-    as one text: the model garbled it and the result was squeezed into one box.
+    The pieces of a page to translate: one per table cell or line — except lines
+    that wrap into the next one (same size, near the full block width, alone on
+    their row), which are joined into one sentence. Translating whole MuPDF blocks
+    sent entire menu columns as one text: the model garbled it and the result was
+    squeezed into one box.
 
-    Each unit: text, rect to write into (from the line's start to the block's
-    edge, so a longer translation still fits), font size, colour, bold, angle,
-    and the exact span boxes to erase. Icon glyphs (private-use characters) stay
-    in place, except for right-to-left targets, where the text moves to the
-    right edge and an icon left behind would sit on top of it.
+    Each unit: text, rect to write into (from the line's start edge to the nearest
+    neighbour on its row, or the block's edge), font size, colour, bold, angle, and
+    the boxes to erase. Icon glyphs (private-use characters) stay in place, except
+    for right-to-left targets, where the text moves to the right edge and an icon
+    left behind would sit on top of it.
     """
-    units = []
-    for block in page.get_text("dict")["blocks"]:
+    from .rtl_docx import rtl_majority
+
+    raw = page.get_text("rawdict")["blocks"]
+    marks = _list_marks(page, raw)
+    page_rtl = rtl_majority("".join(c["c"] for b in raw for ln in b.get("lines", [])
+                                    for sp in ln["spans"] for c in sp["chars"]))
+
+    def starts_item(pc, rtl):
+        """A bullet (glyph or small drawn shape) just before the line's start edge."""
+        mid, gap = (pc["y0"] + pc["y1"]) / 2, 3 * pc["size"]
+        for m in marks:
+            if not (m.y0 - 2 <= mid <= m.y1 + 2 or pc["y0"] <= (m.y0 + m.y1) / 2 <= pc["y1"]):
+                continue
+            if (rtl and 0 <= m.x0 - pc["x1"] <= gap) or (not rtl and 0 <= pc["x0"] - m.x1 <= gap):
+                return True
+        return False
+
+    pieces = []
+    for block in raw:
         if block.get("type") != 0:
             continue
         bx0, by0, bx1, by1 = block["bbox"]
-        bw = max(1.0, bx1 - bx0)
-        current = None
+        for pc in _line_pieces(page, block, erase_icons, page_rtl):
+            pc["rtl"] = bool(_RTL_TEXT.search(pc["text"]) and rtl_majority(pc["text"]))
+            pc.update(block_x0=bx0, block_x1=bx1, angle=0)
+            pieces.append(pc)
+
+    def edge(pc):
+        return pc["x1"] if pc["rtl"] else pc["x0"]
+
+    def column_width(pc):
+        """
+        What a full line is here: the typical width of nearby lines that start at the
+        same edge (the median, so one wide intro line above a column doesn't count).
+        """
+        widths = sorted(q["x1"] - q["x0"] for q in pieces
+                        if q["alone"] and q["rtl"] == pc["rtl"] and abs(edge(q) - edge(pc)) < 6
+                        and abs(q["y0"] - pc["y0"]) < 15 * pc["size"])
+        return widths[len(widths) // 2] if widths else pc["x1"] - pc["x0"]
+
+    # Lines that wrap into the next one are joined into one sentence, also across
+    # MuPDF blocks (a paragraph's second line is often a block of its own): same
+    # column edge, same size, right below, the line above is full, and the new line
+    # does not start a list item.
+    units = []
+    for pc in pieces:
+        target = None
+        if (pc["alone"] and not starts_item(pc, pc["rtl"]) and not _NUMBERED.match(pc["text"])
+                and not _MARKER_ONLY.match(pc["text"])):
+            for cur in reversed(units[-8:]):
+                if (cur["alone"] and cur["angle"] == 0 and not _MARKER_ONLY.match(cur["text"]) and cur["rtl"] == pc["rtl"]
+                        and abs(pc["size"] - cur["size"]) < 0.6
+                        and abs(edge(pc) - edge(cur)) < 6
+                        and -0.3 * pc["size"] < pc["y0"] - cur["y1"] < pc["size"] * 0.8
+                        and cur["last_w"] >= 0.85 * cur["col_w"]):
+                    target = cur
+                    break
+        if target:
+            target["text"] += " " + pc["text"]
+            target["y1"] = pc["y1"]
+            target["x0"] = min(target["x0"], pc["x0"])
+            target["x1"] = max(target["x1"], pc["x1"])
+            target["last_w"] = pc["x1"] - pc["x0"]
+            target["redact"] += pc["redact"]
+            target["hidden"] = target["hidden"] and pc["hidden"]
+            target["block_x0"] = min(target["block_x0"], pc["block_x0"])
+            target["block_x1"] = max(target["block_x1"], pc["block_x1"])
+            continue
+        units.append({**pc, "last_w": pc["x1"] - pc["x0"], "col_w": column_width(pc)})
+
+    for block in raw:
+        if block.get("type") != 0:
+            continue
+        bx0, by0, bx1, by1 = block["bbox"]
+        # sideways text: one unit per line, in its original box
         for line in block["lines"]:
-            spans = [sp for sp in line["spans"] if _PUA.sub("", sp["text"]).strip()]
+            dx, dy = (round(v) for v in line["dir"])
+            if (dx, dy) == (1, 0):
+                continue
+            spans = [sp for sp in line["spans"] if _PUA.sub("", "".join(c["c"] for c in sp["chars"])).strip()]
             if not spans:
                 continue
-            text = _PUA.sub("", "".join(sp["text"] for sp in line["spans"])).strip()
-            size = sorted(sp["size"] for sp in spans)[len(spans) // 2]
-            lx0, ly0, lx1, ly1 = line["bbox"]
+            text = _PUA.sub("", "".join(c["c"] for sp in line["spans"] for c in sp["chars"])).strip()
             boxes = [fitz.Rect(sp["bbox"]) for sp in (line["spans"] if erase_icons else spans)]
-            if (current and abs(size - current["size"]) < 0.6
-                    and abs(lx0 - current["x0"]) < 6
-                    and ly0 - current["y1"] < size * 0.8
-                    and current["last_w"] >= 0.8 * bw):
-                current["text"] += " " + text
-                current["y1"] = ly1
-                current["x1"] = max(current["x1"], lx1)
-                current["last_w"] = lx1 - lx0
-                current["redact"] += boxes
-                current["hidden"] = current["hidden"] and all(sp.get("alpha", 255) == 0 for sp in spans)
-                continue
-            sp0 = spans[0]
-            dx, dy = line["dir"]
-            current = {
-                "text": text, "size": size, "x0": lx0, "x1": lx1, "y0": ly0, "y1": ly1,
-                "block_x0": bx0,
-                "last_w": lx1 - lx0, "redact": boxes, "block_x1": bx1,
-                "color": sp0.get("color", 0), "bold": bool(sp0.get("flags", 0) & 16),
-                "angle": _DIR_TO_ROTATE.get((round(dx), round(dy)), 0),
-                # invisible OCR text over a scan: the words people see are in the image
+            lx0, ly0, lx1, ly1 = line["bbox"]
+            units.append({
+                "text": text, "size": sorted(sp["size"] for sp in spans)[len(spans) // 2],
+                "x0": lx0, "x1": lx1, "y0": ly0, "y1": ly1, "block_x0": bx0, "block_x1": bx1,
+                "last_w": lx1 - lx0, "redact": boxes, "alone": True, "rtl": False,
+                "color": spans[0].get("color", 0), "bold": bool(spans[0].get("flags", 0) & 16),
+                "angle": _DIR_TO_ROTATE.get((dx, dy), 0),
                 "hidden": all(sp.get("alpha", 255) == 0 for sp in spans),
-            }
-            units.append(current)
+            })
+
+    # room on the row: a cell's translation may use its whole cell (up to the table's
+    # vertical border, when there is one) but may not run into the next cell
+    edges = _vertical_edges(page)
+    flat = [u for u in units if u["angle"] == 0]
+    for u in flat:
+        u["left"], u["right"] = u["block_x0"], u["block_x1"]
+        h = u["y1"] - u["y0"]
+        mid = (u["y0"] + u["y1"]) / 2
+        crossing = [x for x, ey0, ey1 in edges if ey0 <= mid <= ey1]
+        left_edges = [x for x in crossing if x < u["x0"] - 1]
+        right_edges = [x for x in crossing if x > u["x1"] + 1]
+        if left_edges:
+            u["left"] = max(left_edges) + 3
+        if right_edges:
+            u["right"] = min(right_edges) - 3
+        for v in flat:
+            if v is u or min(u["y1"], v["y1"]) - max(u["y0"], v["y0"]) < 0.3 * min(h, v["y1"] - v["y0"]):
+                continue
+            if v["x1"] <= u["x0"]:
+                u["left"] = max(u["left"], v["x1"] + 3)
+            elif v["x0"] >= u["x1"]:
+                u["right"] = min(u["right"], v["x0"] - 3)
+
     out = []
     prev_bottom = {}
     for u in units:
@@ -132,10 +384,12 @@ def _text_units(page: "fitz.Page", erase_icons: bool = False) -> list[dict]:
             # its right edge, so keep that edge and give the translation the room to
             # its left (a short right-aligned Hebrew line otherwise left a sliver
             # of space and the English shrank to nothing)
-            rect = fitz.Rect(u["block_x0"], u["y0"], max(u["x1"], u["block_x0"] + 20), u["y1"])
+            left = min(u["left"], u["x0"])
+            rect = fitz.Rect(left, u["y0"], max(u["x1"], left + 20), u["y1"])
             u["align_right"] = True
         elif u["angle"] == 0:
-            rect = fitz.Rect(u["x0"], u["y0"], max(u["block_x1"], u["x0"] + 20), u["y1"])
+            right = max(u["right"], u["x1"])
+            rect = fitz.Rect(u["x0"], u["y0"], max(right, u["x0"] + 20), u["y1"])
         else:  # sideways text: keep the original box
             rect = fitz.Rect(u["redact"][0])
             for r in u["redact"][1:]:
@@ -266,6 +520,12 @@ class TranslateService:
                             # descenders) spills past them, so cover a little more
                             m = r.height * 0.25
                             r = fitz.Rect(r.x0 - 2, r.y0 - m, r.x1 + 2, r.y1 + m) & page.rect
+                        else:
+                            # line boxes include leading and overlap the rows above and
+                            # below; a character is removed if its box touches the area,
+                            # so erase only the middle band (a table lost a neighbouring
+                            # cell's "92" this way)
+                            r = fitz.Rect(r.x0 + 0.5, r.y0 + 0.3 * r.height, r.x1 - 0.5, r.y1 - 0.3 * r.height)
                         page.add_redact_annot(r, fill=(1, 1, 1) if unit["hidden"] else False)
                 page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE,
                                       graphics=fitz.PDF_REDACT_LINE_ART_NONE)
