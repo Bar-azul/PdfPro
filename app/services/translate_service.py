@@ -184,7 +184,9 @@ def _line_pieces(page: "fitz.Page", block: dict, erase_icons: bool, page_rtl: bo
                 "text": text, "size": sizes[len(sizes) // 2],
                 "x0": box.x0, "x1": box.x1, "y0": y0, "y1": y1,
                 "redact": [fitz.Rect(erase.x0, y0, erase.x1, y1)],
-                "color": first["color"], "bold": bool(first["flags"] & 16),
+                "color": first["color"],
+                # bold only when most of the piece is: a bold lead-in ("לחשוב בקול.") shouldn't make the line bold
+                "bold": sum(1 for c in ink if c["flags"] & 16) * 2 > len(ink),
                 "hidden": all(c["alpha"] == 0 for c in ink),
             })
         # alone on its row (a bullet or list number next to it doesn't count)
@@ -237,6 +239,78 @@ def _vertical_edges(page: "fitz.Page") -> list[tuple[float, float, float]]:
     return edges
 
 
+def _trace_rows(page: "fitz.Page") -> list[dict] | None:
+    """
+    Horizontal text rebuilt from the page's glyph trace, as rawdict-like blocks (one
+    per baseline), or None when MuPDF's normal extraction already has every glyph.
+
+    Some PDFs (Google Docs exports with Hebrew) draw each letter as its own text
+    object, right to left. MuPDF's text extraction then drops a large share of the
+    letters as if they were overprinted duplicates; whole phrases vanished, were never
+    erased and stayed in Hebrew under the English. The glyph trace still has every
+    letter with its Unicode value and position.
+    """
+    try:
+        trace = page.get_texttrace()
+    except Exception:
+        return None
+    area = page.rect
+    glyphs, seen = [], set()
+    for sp in trace:
+        if sp.get("type") == 2 or tuple(round(v) for v in sp["dir"]) != (1, 0) or sp.get("wmode"):
+            continue
+        col = sp.get("color") or (0,)
+        if len(col) >= 3:
+            color = (int(col[0] * 255) << 16) | (int(col[1] * 255) << 8) | int(col[2] * 255)
+        else:
+            g = int(col[0] * 255) if col else 0
+            color = (g << 16) | (g << 8) | g
+        alpha = 0 if sp.get("type") == 3 or sp.get("opacity", 1) == 0 else 255
+        for u, _gid, origin, bbox in sp["chars"]:
+            if u < 32 and u != 9:
+                continue
+            r = fitz.Rect(bbox)
+            if r.is_empty and chr(u) != " ":
+                continue
+            if not r.intersects(area):
+                continue
+            key = (u, round(origin[0]), round(origin[1]))
+            if key in seen:            # drawn twice (fake bold): keep one
+                continue
+            seen.add(key)
+            glyphs.append({"c": chr(u), "origin": origin, "bbox": r, "size": sp["size"],
+                           "color": color, "flags": sp.get("flags", 0), "alpha": alpha})
+    ink = sum(1 for g in glyphs if g["c"].strip())
+    have = sum(1 for b in page.get_text("rawdict")["blocks"] for ln in b.get("lines", [])
+               if tuple(round(v) for v in ln["dir"]) == (1, 0)
+               for sp in ln["spans"] for c in sp["chars"] if c["c"].strip())
+    if not ink or have >= 0.97 * ink:
+        return None
+
+    x0 = min(g["bbox"].x0 for g in glyphs if g["c"].strip())
+    x1 = max(g["bbox"].x1 for g in glyphs if g["c"].strip())
+    rows = []
+    for g in sorted(glyphs, key=lambda g: g["origin"][1]):
+        for row in rows:
+            if abs(g["origin"][1] - row["base"]) < 0.3 * min(g["size"], row["size"]):
+                row["glyphs"].append(g)
+                break
+        else:
+            rows.append({"base": g["origin"][1], "size": g["size"], "glyphs": [g]})
+    blocks = []
+    for row in rows:
+        gl = row["glyphs"]
+        box = fitz.Rect(gl[0]["bbox"])
+        for g in gl[1:]:
+            box |= g["bbox"]
+        spans = [{"size": g["size"], "color": g["color"], "flags": g["flags"], "alpha": g["alpha"],
+                  "bbox": tuple(g["bbox"]),
+                  "chars": [{"c": g["c"], "bbox": tuple(g["bbox"]), "origin": g["origin"]}]} for g in gl]
+        blocks.append({"type": 0, "bbox": (x0, box.y0, x1, box.y1),
+                       "lines": [{"dir": (1.0, 0.0), "bbox": tuple(box), "spans": spans}]})
+    return blocks
+
+
 def _text_units(page: "fitz.Page", erase_icons: bool = False) -> list[dict]:
     """
     The pieces of a page to translate: one per table cell or line — except lines
@@ -268,8 +342,9 @@ def _text_units(page: "fitz.Page", erase_icons: bool = False) -> list[dict]:
                 return True
         return False
 
+    traced = _trace_rows(page)
     pieces = []
-    for block in raw:
+    for block in (traced if traced is not None else raw):
         if block.get("type") != 0:
             continue
         bx0, by0, bx1, by1 = block["bbox"]
@@ -291,6 +366,13 @@ def _text_units(page: "fitz.Page", erase_icons: bool = False) -> list[dict]:
                         and abs(q["y0"] - pc["y0"]) < 15 * pc["size"])
         return widths[len(widths) // 2] if widths else pc["x1"] - pc["x0"]
 
+    def hanging(cur, pc):
+        """The second line of a numbered item starts after the number ("1. ")."""
+        if not cur.get("numbered"):
+            return False
+        indent = edge(cur) - edge(pc) if pc["rtl"] else edge(pc) - edge(cur)
+        return 0 < indent < 3 * pc["size"]
+
     # Lines that wrap into the next one are joined into one sentence, also across
     # MuPDF blocks (a paragraph's second line is often a block of its own): same
     # column edge, same size, right below, the line above is full, and the new line
@@ -303,7 +385,7 @@ def _text_units(page: "fitz.Page", erase_icons: bool = False) -> list[dict]:
             for cur in reversed(units[-8:]):
                 if (cur["alone"] and cur["angle"] == 0 and not _MARKER_ONLY.match(cur["text"]) and cur["rtl"] == pc["rtl"]
                         and abs(pc["size"] - cur["size"]) < 0.6
-                        and abs(edge(pc) - edge(cur)) < 6
+                        and (abs(edge(pc) - edge(cur)) < 6 or hanging(cur, pc))
                         and -0.3 * pc["size"] < pc["y0"] - cur["y1"] < pc["size"] * 0.8
                         and cur["last_w"] >= 0.85 * cur["col_w"]):
                     target = cur
@@ -319,7 +401,8 @@ def _text_units(page: "fitz.Page", erase_icons: bool = False) -> list[dict]:
             target["block_x0"] = min(target["block_x0"], pc["block_x0"])
             target["block_x1"] = max(target["block_x1"], pc["block_x1"])
             continue
-        units.append({**pc, "last_w": pc["x1"] - pc["x0"], "col_w": column_width(pc)})
+        units.append({**pc, "last_w": pc["x1"] - pc["x0"], "col_w": column_width(pc),
+                      "numbered": bool(_NUMBERED.match(pc["text"]))})
 
     for block in raw:
         if block.get("type") != 0:
@@ -566,7 +649,9 @@ class TranslateService:
                 if not (0 <= i < doc.page_count):
                     continue
                 page = doc[i]
-                paragraphs = [b[4].strip() for b in page.get_text("blocks") if b[6] == 0 and b[4].strip()]
+                # the same reading of the page as the in-place mode: logical order, wrapped
+                # lines joined, letters that MuPDF's block text drops recovered
+                paragraphs = [u["text"] for u in _text_units(page) if u["text"].strip()]
                 if not paragraphs:
                     new_doc.new_page(width=page.rect.width, height=page.rect.height)
                     continue
