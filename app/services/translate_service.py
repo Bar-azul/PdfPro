@@ -61,6 +61,23 @@ def _compact(doc: "fitz.Document"):
         logger.warning(f"Font subsetting failed: {e}")
 
 
+_COMPACT_EVERY = 8   # pages
+
+
+def _compacted(doc: "fitz.Document") -> "fitz.Document":
+    """
+    The same document with its embedded fonts subset and duplicates merged, reopened
+    from memory. Every translated box embeds a full copy of its fonts (about 0.2 MB),
+    and they were only merged when saving at the end: a 104-page file peaked at
+    ~550 MB and a long document brought the server down mid-request (the browser
+    only saw a dropped connection). Doing it every few pages keeps memory flat.
+    """
+    _compact(doc)
+    data = doc.tobytes(deflate=True, garbage=4)
+    doc.close()
+    return fitz.open("pdf", data)
+
+
 _RTL_TEXT = re.compile(r"[\u0590-\u05FF\u0600-\u06FF]")
 _LATIN_GROUP = re.compile(r"\(([^()\u0590-\u05FF\u0600-\u06FF]*)\)")
 _PUA = re.compile(r"[\uE000-\uF8FF]")
@@ -561,7 +578,8 @@ class TranslateService:
         stats: dict,
     ) -> Path:
         """Cover each text block with white, then lay the translation into the same box."""
-        with fitz.open(pdf_path) as doc:
+        doc = fitz.open(pdf_path)
+        try:
             target = [p - 1 for p in pages] if pages else range(doc.page_count)
 
             target = [i for i in target if 0 <= i < doc.page_count]
@@ -577,7 +595,9 @@ class TranslateService:
             translations = translator.translate_many([u["text"] for u in all_units]) if all_units else []
 
             pos = 0
-            for i, units in zip(target, page_units):
+            for k, (i, units) in enumerate(zip(target, page_units)):
+                if k and k % _COMPACT_EVERY == 0:
+                    doc = _compacted(doc)
                 page = doc[i]
                 placed = []
                 for unit, translated in zip(units, translations[pos:pos + len(units)]):
@@ -626,6 +646,8 @@ class TranslateService:
             out = _temp_pdf("translated")
             _compact(doc)
             doc.save(out, deflate=True, garbage=4)
+        finally:
+            doc.close()
         return out
 
     # ── Clean strategy ────────────────────────────────────────────────────────
